@@ -24,19 +24,42 @@ option(XENOR_ENGINE_BUILD_EXAMPLES "Build example programs." ON)
 option(XENOR_ENGINE_BUILD_TESTS "Build unit tests." ON)
 option(XENOR_ENGINE_BUILD_BENCHMARKS "Build benchmark targets." ON)
 
-add_library(xenor_engine INTERFACE)
+include(cmake/CompilerWarnings.cmake)
+
+add_library(
+  xenor_engine
+  src/simulation_clock.cpp
+  src/simulation_config.cpp)
 add_library(xenor::engine ALIAS xenor_engine)
 
-target_compile_features(xenor_engine INTERFACE cxx_std_20)
+target_compile_features(xenor_engine PUBLIC cxx_std_20)
 target_include_directories(
   xenor_engine
-  INTERFACE
+  PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
+xenor_engine_configure_warnings(xenor_engine)
+
+target_sources(
+  xenor_engine
+  PUBLIC
+    FILE_SET public_headers
+    TYPE HEADERS
+    BASE_DIRS ${PROJECT_SOURCE_DIR}/include
+    FILES
+      include/xenor/simulation_clock.hpp
+      include/xenor/simulation_config.hpp
+      include/xenor/simulation_engine.hpp
+      include/xenor/simulation_snapshot.hpp
+      include/xenor/simulation_state.hpp
+      include/xenor/step_context.hpp
+      include/xenor/xenor.hpp)
+
 install(
   TARGETS xenor_engine
-  EXPORT xenor-engine-targets)
+  EXPORT xenor-engine-targets
+  FILE_SET public_headers DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(
   EXPORT xenor-engine-targets
