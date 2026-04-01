@@ -27,6 +27,7 @@ public:
   using state_type = State;
   using tick_type = SimulationClock::tick_type;
   using duration_type = SimulationConfig::duration_type;
+  using seed_type = SimulationConfig::seed_type;
   using system_type = std::function<void(State&, const StepContext&)>;
 
   static_assert(std::copyable<State>,
@@ -41,6 +42,7 @@ public:
   [[nodiscard]] const SimulationClock& clock() const noexcept { return clock_; }
   [[nodiscard]] const State& state() const noexcept { return state_; }
   [[nodiscard]] State& state() noexcept { return state_; }
+  [[nodiscard]] seed_type seed() const noexcept { return config_.seed(); }
 
   std::size_t add_system(std::string name, system_type system) {
     if (name.empty()) {
@@ -75,10 +77,15 @@ public:
     }
 
     const auto next_tick = current_tick + 1;
+    const auto step_seed = derive_step_seed(config_.seed(), next_tick);
+    DeterministicRng step_rng{step_seed};
     const StepContext context{
-        .tick = next_tick,
-        .tick_duration = config_.tick_duration(),
-        .elapsed = clock_.elapsed_duration_at(next_tick),
+        next_tick,
+        config_.tick_duration(),
+        clock_.elapsed_duration_at(next_tick),
+        config_.seed(),
+        step_seed,
+        &step_rng,
     };
 
     for (const auto& system : systems_) {
@@ -99,6 +106,7 @@ public:
     return SimulationSnapshot<State>{
         .tick = clock_.current_tick(),
         .elapsed = clock_.elapsed_duration(),
+        .seed = config_.seed(),
         .state = state_,
     };
   }
@@ -117,10 +125,19 @@ private:
     system_type callback;
   };
 
+  [[nodiscard]] static seed_type derive_step_seed(seed_type seed, tick_type tick) noexcept {
+    return DeterministicRng::mix(
+        seed + 0x9e3779b97f4a7c15ULL * static_cast<seed_type>(tick));
+  }
+
   void validate_snapshot(const SimulationSnapshot<State>& snapshot) const {
     if (snapshot.elapsed != clock_.elapsed_duration_at(snapshot.tick)) {
       throw std::invalid_argument(
           "snapshot elapsed duration does not match the engine configuration");
+    }
+
+    if (snapshot.seed != config_.seed()) {
+      throw std::invalid_argument("snapshot seed does not match the engine configuration");
     }
 
     if (snapshot.state.last_completed_tick() != snapshot.tick) {
