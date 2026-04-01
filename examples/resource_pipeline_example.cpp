@@ -48,6 +48,7 @@ auto make_engine(xenor::SimulationConfig::seed_type seed) {
           xenor::SimulationConfig{50ms, seed}};
 
   engine.add_system(
+      xenor::SystemPhase::PreUpdate,
       "intake",
       [](ResourcePipelineState& state,
          const xenor::InputStepContext<ResourceTickInput>& context) {
@@ -55,6 +56,7 @@ auto make_engine(xenor::SimulationConfig::seed_type seed) {
       });
 
   engine.add_system(
+      xenor::SystemPhase::PreUpdate,
       "yield_adjustment",
       [](ResourcePipelineState& state,
          const xenor::InputStepContext<ResourceTickInput>& context) {
@@ -64,6 +66,7 @@ auto make_engine(xenor::SimulationConfig::seed_type seed) {
       });
 
   engine.add_system(
+      xenor::SystemPhase::Update,
       "smelting",
       [](ResourcePipelineState& state,
          const xenor::InputStepContext<ResourceTickInput>&) {
@@ -73,6 +76,7 @@ auto make_engine(xenor::SimulationConfig::seed_type seed) {
       });
 
   engine.add_system(
+      xenor::SystemPhase::PostUpdate,
       "dispatch",
       [](ResourcePipelineState& state,
          const xenor::InputStepContext<ResourceTickInput>& context) {

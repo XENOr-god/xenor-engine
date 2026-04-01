@@ -68,17 +68,23 @@ auto make_pipeline_engine() {
 
   xenor::SimulationEngine<PipelineState> engine{xenor::SimulationConfig{25ms}};
 
-  engine.add_system("mining", [](PipelineState& state, const xenor::StepContext&) {
+  engine.add_system(xenor::SystemPhase::PreUpdate,
+                    "mining",
+                    [](PipelineState& state, const xenor::StepContext&) {
     state.ore += 4;
   });
 
-  engine.add_system("smelting", [](PipelineState& state, const xenor::StepContext&) {
+  engine.add_system(xenor::SystemPhase::Update,
+                    "smelting",
+                    [](PipelineState& state, const xenor::StepContext&) {
     const auto ingot_batches = state.ore / 2;
     state.ore -= ingot_batches * 2;
     state.ingots += ingot_batches;
   });
 
-  engine.add_system("packing", [](PipelineState& state, const xenor::StepContext&) {
+  engine.add_system(xenor::SystemPhase::PostUpdate,
+                    "packing",
+                    [](PipelineState& state, const xenor::StepContext&) {
     const auto finished_batches = state.ingots / 3;
     state.ingots -= finished_batches * 3;
     state.finished_units += finished_batches;
@@ -94,6 +100,7 @@ auto make_seeded_input_engine(xenor::SimulationConfig::seed_type seed) {
       xenor::SimulationConfig{5ms, seed}};
 
   engine.add_system(
+      xenor::SystemPhase::PreUpdate,
       "record_input",
       [](SeededInputState& state, const xenor::InputStepContext<WorkloadInput>& context) {
         const auto& input = context.input();
@@ -104,12 +111,14 @@ auto make_seeded_input_engine(xenor::SimulationConfig::seed_type seed) {
       });
 
   engine.add_system(
+      xenor::SystemPhase::PreUpdate,
       "receive_supply",
       [](SeededInputState& state, const xenor::InputStepContext<WorkloadInput>& context) {
         state.inventory += context.input().supply;
       });
 
   engine.add_system(
+      xenor::SystemPhase::Update,
       "seeded_adjustment",
       [](SeededInputState& state, const xenor::InputStepContext<WorkloadInput>& context) {
         const auto random_value = context.rng().next_u64();
@@ -118,6 +127,7 @@ auto make_seeded_input_engine(xenor::SimulationConfig::seed_type seed) {
       });
 
   engine.add_system(
+      xenor::SystemPhase::PostUpdate,
       "ship",
       [](SeededInputState& state, const xenor::InputStepContext<WorkloadInput>& context) {
         const auto& input = context.input();
@@ -211,6 +221,68 @@ TEST_CASE("System execution order remains stable", "[engine]") {
 
   const std::vector<std::string> expected{
       "first:1", "second:1", "first:2", "second:2"};
+  REQUIRE(engine.state().execution_trace == expected);
+}
+
+TEST_CASE("Systems execute in fixed phase order and registration order within each phase",
+          "[engine][phase]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 13}};
+  engine.add_system(xenor::SystemPhase::PostUpdate,
+                    "post",
+                    [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("post:" + std::to_string(context.tick));
+  });
+  engine.add_system(xenor::SystemPhase::Update,
+                    "update_a",
+                    [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("update_a:" + std::to_string(context.tick));
+  });
+  engine.add_system(xenor::SystemPhase::PreUpdate,
+                    "pre_a",
+                    [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("pre_a:" + std::to_string(context.tick));
+  });
+  engine.add_system(xenor::SystemPhase::Update,
+                    "update_b",
+                    [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("update_b:" + std::to_string(context.tick));
+  });
+  engine.add_system(xenor::SystemPhase::PreUpdate,
+                    "pre_b",
+                    [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("pre_b:" + std::to_string(context.tick));
+  });
+
+  engine.step();
+
+  const std::vector<std::string> expected{
+      "pre_a:1", "pre_b:1", "update_a:1", "update_b:1", "post:1"};
+  REQUIRE(engine.state().execution_trace == expected);
+}
+
+TEST_CASE("Default system registration uses the update phase", "[engine][phase]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 17}};
+  engine.add_system(xenor::SystemPhase::PostUpdate,
+                    "post",
+                    [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("post:" + std::to_string(context.tick));
+  });
+  engine.add_system("default", [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("default:" + std::to_string(context.tick));
+  });
+  engine.add_system(xenor::SystemPhase::PreUpdate,
+                    "pre",
+                    [](CounterState& state, const xenor::StepContext& context) {
+    state.execution_trace.push_back("pre:" + std::to_string(context.tick));
+  });
+
+  engine.step();
+
+  const std::vector<std::string> expected{"pre:1", "default:1", "post:1"};
   REQUIRE(engine.state().execution_trace == expected);
 }
 
