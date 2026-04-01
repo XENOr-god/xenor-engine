@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -7,93 +8,136 @@
 
 namespace {
 
+struct ResourceTickInput {
+  std::uint64_t inbound_ore{0};
+  std::uint64_t outbound_target{0};
+};
+
 struct ResourcePipelineState final : xenor::SimulationState {
   std::uint64_t ore{0};
   std::uint64_t ingots{0};
-  std::uint64_t components{0};
   std::uint64_t finished_units{0};
+  std::uint64_t backlog{0};
+  std::uint64_t random_checksum{0};
 };
-
-auto make_engine() {
-  using namespace std::chrono_literals;
-
-  auto engine =
-      xenor::SimulationEngine<ResourcePipelineState>{xenor::SimulationConfig{50ms}};
-
-  engine.add_system("extraction", [](ResourcePipelineState& state, const xenor::StepContext&) {
-    state.ore += 5;
-  });
-
-  engine.add_system("smelting", [](ResourcePipelineState& state, const xenor::StepContext&) {
-    const auto refined_batches = state.ore / 2;
-    state.ore -= refined_batches * 2;
-    state.ingots += refined_batches;
-  });
-
-  engine.add_system("machining", [](ResourcePipelineState& state, const xenor::StepContext&) {
-    const auto component_batches = state.ingots / 3;
-    state.ingots -= component_batches * 3;
-    state.components += component_batches;
-  });
-
-  engine.add_system("packing", [](ResourcePipelineState& state, const xenor::StepContext&) {
-    const auto finished_batches = state.components / 2;
-    state.components -= finished_batches * 2;
-    state.finished_units += finished_batches;
-  });
-
-  return engine;
-}
 
 bool identical(const ResourcePipelineState& left, const ResourcePipelineState& right) {
   return left.ore == right.ore && left.ingots == right.ingots &&
-         left.components == right.components &&
          left.finished_units == right.finished_units &&
+         left.backlog == right.backlog &&
+         left.random_checksum == right.random_checksum &&
          left.last_completed_tick() == right.last_completed_tick();
 }
 
 bool identical(const xenor::SimulationSnapshot<ResourcePipelineState>& left,
                const xenor::SimulationSnapshot<ResourcePipelineState>& right) {
   return left.tick == right.tick && left.elapsed == right.elapsed &&
-         identical(left.state, right.state);
+         left.seed == right.seed && identical(left.state, right.state);
+}
+
+auto make_inputs() {
+  return xenor::InputSequence<ResourceTickInput>{
+      {{3, 1}, {1, 2}, {4, 2}, {2, 3}, {5, 2}, {1, 1}, {3, 3}, {2, 1}}};
+}
+
+auto make_engine(xenor::SimulationConfig::seed_type seed) {
+  using namespace std::chrono_literals;
+
+  auto engine =
+      xenor::SimulationEngine<ResourcePipelineState, ResourceTickInput>{
+          xenor::SimulationConfig{50ms, seed}};
+
+  engine.add_system(
+      "intake",
+      [](ResourcePipelineState& state,
+         const xenor::InputStepContext<ResourceTickInput>& context) {
+        state.ore += context.input().inbound_ore;
+      });
+
+  engine.add_system(
+      "yield_adjustment",
+      [](ResourcePipelineState& state,
+         const xenor::InputStepContext<ResourceTickInput>& context) {
+        const auto random_value = context.rng().next_u64();
+        state.random_checksum ^= random_value + context.step_seed;
+        state.ore += random_value % 2ULL;
+      });
+
+  engine.add_system(
+      "smelting",
+      [](ResourcePipelineState& state,
+         const xenor::InputStepContext<ResourceTickInput>&) {
+        const auto ingot_batches = state.ore / 2;
+        state.ore -= ingot_batches * 2;
+        state.ingots += ingot_batches;
+      });
+
+  engine.add_system(
+      "dispatch",
+      [](ResourcePipelineState& state,
+         const xenor::InputStepContext<ResourceTickInput>& context) {
+        const auto finished_batches =
+            std::min(state.ingots, context.input().outbound_target);
+        state.ingots -= finished_batches;
+        state.finished_units += finished_batches;
+        state.backlog += context.input().outbound_target - finished_batches;
+      });
+
+  return engine;
 }
 
 }  // namespace
 
 int main() {
-  auto engine = make_engine();
+  constexpr xenor::SimulationConfig::seed_type seed = 41;
+  constexpr std::size_t checkpoint_ticks = 5;
 
-  constexpr std::uint64_t checkpoint_ticks = 8;
-  constexpr std::uint64_t continuation_ticks = 4;
+  const auto inputs = make_inputs();
+  const auto initial_inputs = inputs.slice(0, checkpoint_ticks);
+  const auto remaining_inputs = inputs.slice(checkpoint_ticks);
 
-  engine.run_for_ticks(checkpoint_ticks);
-  const auto checkpoint = engine.capture_snapshot();
+  auto uninterrupted = make_engine(seed);
+  auto restored = make_engine(seed);
+  auto repeated = make_engine(seed);
 
-  engine.run_for_ticks(continuation_ticks);
-  const auto uninterrupted = engine.capture_snapshot();
+  uninterrupted.run_for_sequence(inputs);
+  const auto uninterrupted_final = uninterrupted.capture_snapshot();
 
-  engine.restore_snapshot(checkpoint);
-  engine.run_for_ticks(continuation_ticks);
-  const auto replayed = engine.capture_snapshot();
+  restored.run_for_sequence(initial_inputs);
+  const auto checkpoint = restored.capture_snapshot();
 
-  if (!identical(uninterrupted, replayed)) {
-    std::cerr << "deterministic replay check failed\n";
+  restored.run_for_sequence(remaining_inputs);
+  const auto first_continuation = restored.capture_snapshot();
+
+  restored.restore_snapshot(checkpoint);
+  restored.run_for_sequence(remaining_inputs);
+  const auto replayed_continuation = restored.capture_snapshot();
+
+  repeated.run_for_sequence(inputs);
+  const auto repeated_final = repeated.capture_snapshot();
+
+  if (!identical(uninterrupted_final, repeated_final) ||
+      !identical(first_continuation, replayed_continuation) ||
+      !identical(uninterrupted_final, replayed_continuation)) {
+    std::cerr << "deterministic input replay check failed\n";
     return EXIT_FAILURE;
   }
 
   const auto checkpoint_elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(checkpoint.elapsed);
   const auto elapsed =
-      std::chrono::duration_cast<std::chrono::milliseconds>(uninterrupted.elapsed);
+      std::chrono::duration_cast<std::chrono::milliseconds>(uninterrupted_final.elapsed);
 
+  std::cout << "seed: " << seed << '\n';
   std::cout << "checkpoint_tick: " << checkpoint.tick << '\n';
   std::cout << "checkpoint_elapsed_ms: " << checkpoint_elapsed.count() << '\n';
-  std::cout << "tick: " << uninterrupted.tick << '\n';
+  std::cout << "tick: " << uninterrupted_final.tick << '\n';
   std::cout << "elapsed_ms: " << elapsed.count() << '\n';
-  std::cout << "ore: " << uninterrupted.state.ore << '\n';
-  std::cout << "ingots: " << uninterrupted.state.ingots << '\n';
-  std::cout << "components: " << uninterrupted.state.components << '\n';
-  std::cout << "finished_units: " << uninterrupted.state.finished_units << '\n';
+  std::cout << "ore: " << uninterrupted_final.state.ore << '\n';
+  std::cout << "ingots: " << uninterrupted_final.state.ingots << '\n';
+  std::cout << "finished_units: " << uninterrupted_final.state.finished_units << '\n';
+  std::cout << "backlog: " << uninterrupted_final.state.backlog << '\n';
+  std::cout << "random_checksum: " << uninterrupted_final.state.random_checksum << '\n';
 
   return EXIT_SUCCESS;
 }
