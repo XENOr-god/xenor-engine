@@ -12,6 +12,7 @@ The current repository provides:
 - explicit fixed-timestep execution
 - explicit seed handling in simulation configuration
 - stable system registration and update ordering
+- fixed phased system execution
 - deterministic per-tick input sequencing
 - user-owned simulation state with deterministic tick metadata
 - tick-scoped deterministic random number generation
@@ -28,6 +29,7 @@ The current repository provides:
 - explicit state transitions
 - explicit seed handling with no hidden global randomness
 - deterministic per-tick input application
+- deterministic execution structure through fixed system phases
 - stable and inspectable update ordering
 - snapshot restore without hidden runtime state
 - architecture that supports replay validation and future replay-oriented features
@@ -57,6 +59,8 @@ The engine is organized around a small set of core types:
   tracks integer tick progression and derived simulated time
 - `SimulationState`
   provides deterministic tick metadata for user-defined state objects
+- `SystemPhase`
+  defines the fixed execution order `PreUpdate`, `Update`, `PostUpdate`
 - `DeterministicRng`
   provides a small deterministic random source for step-local use
 - `InputSequence<Input>`
@@ -69,6 +73,7 @@ The engine is organized around a small set of core types:
   captures tick, elapsed simulated time, the configured seed, and a copy of the current state
 
 Systems are registered explicitly and execute in registration order. The engine does not perform any dynamic scheduling or wall-clock based stepping.
+Systems execute in fixed phase order: `PreUpdate`, `Update`, then `PostUpdate`. Within a phase, execution order remains registration-based. Systems added through the existing `add_system(name, callback)` overload default to the `Update` phase.
 
 State types used with `SimulationEngine<State, Input>` must be copyable. Snapshot capture and restore operate on value copies of the active state.
 
@@ -87,11 +92,12 @@ The current implementation follows these rules:
 - engine time advances in integer ticks only
 - the engine never reads wall-clock time
 - per-tick inputs are applied in explicit sequence order
-- system execution order is stable and explicit
+- phase order is fixed and explicit
+- system execution order within each phase is stable and explicit
 - each executed tick receives a deterministic random source derived from the configured seed and tick number
 - snapshots are copies of deterministic state plus clock metadata
 - restoring a captured snapshot restores the exact tick, elapsed time, configured seed, and state value
-- repeated runs with identical initial state, configuration, seed, inputs, and system logic should produce identical results
+- repeated runs with identical initial state, configuration, seed, inputs, phase registration, and system logic should produce identical results
 
 This does not remove all sources of nondeterminism from user code. Callbacks can still introduce nondeterministic behavior if they read wall-clock time, use unstable containers for externally visible ordering, depend on nondeterministic external input, bypass the step-local deterministic random source, or rely on undefined behavior. The engine is structured to make those hazards visible rather than hide them.
 
@@ -103,11 +109,12 @@ What exists today:
 
 - core fixed-timestep engine library
 - explicit seed handling through `SimulationConfig`
+- phased system registration through `SystemPhase` and `add_system(SystemPhase, ...)`
 - deterministic per-tick input sequencing through `InputSequence<Input>` and `run_for_sequence()`
 - snapshot capture and restore
 - tick-scoped deterministic random number generation through the step context
-- deterministic resource-pipeline example with seed reuse, input sequencing, and restore-and-continue validation
-- unit tests for tick progression, ordering, seed handling, input sequencing, snapshot capture and restore, and repeatability
+- deterministic resource-pipeline example with phased execution, seed reuse, input sequencing, and restore-and-continue validation
+- unit tests for tick progression, phase ordering, seed handling, input sequencing, snapshot capture and restore, and repeatability
 - benchmark target for repeated tick execution
 - Linux CI for configure, build, and test
 
@@ -163,7 +170,7 @@ Build and run the example:
 ```
 
 The example runs a deterministic four-stage resource pipeline, captures a mid-run snapshot, continues execution, restores the snapshot, and verifies that the replayed continuation matches the uninterrupted run.
-It uses an explicit per-tick input sequence, a configured seed, and a tick-scoped deterministic random source. It also verifies that a repeated run with the same inputs and seed produces the same final snapshot.
+It uses explicit `PreUpdate`, `Update`, and `PostUpdate` phases, an explicit per-tick input sequence, a configured seed, and a tick-scoped deterministic random source. It also verifies that a repeated run with the same inputs and seed produces the same final snapshot.
 
 ## Minimal API Sketch
 
@@ -183,9 +190,18 @@ int main() {
   using namespace std::chrono_literals;
 
   xenor::SimulationEngine<State, TickInput> engine{xenor::SimulationConfig{1ms, 41}};
-  engine.add_system("increment", [](State& state, const xenor::InputStepContext<TickInput>& context) {
+  engine.add_system(xenor::SystemPhase::PreUpdate,
+                    "apply_input",
+                    [](State& state, const xenor::InputStepContext<TickInput>& context) {
     state.counter += context.input().delta;
+  });
+  engine.add_system("increment", [](State& state, const xenor::InputStepContext<TickInput>& context) {
     state.counter += context.rng().next_u64() % 2ULL;
+  });
+  engine.add_system(xenor::SystemPhase::PostUpdate,
+                    "finalize",
+                    [](State& state, const xenor::InputStepContext<TickInput>&) {
+    state.counter += 1;
   });
 
   const xenor::InputSequence<TickInput> inputs{{{1}, {2}, {3}}};
@@ -227,6 +243,7 @@ int main() {
 
 - Prefer integer-based state and explicit ordering for simulation logic that must remain reproducible.
 - Keep seeds and per-tick inputs explicit at the engine boundary.
+- Use phases to separate preparation, state mutation, and derived-state work when that structure clarifies deterministic ordering.
 - Use the step-context random source instead of ambient global randomness when repeatability matters.
 - Keep system callbacks small and explicit.
 - Treat benchmark results as workload-specific observations, not universal claims.

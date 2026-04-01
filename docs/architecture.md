@@ -28,6 +28,16 @@ The current design uses inheritance here deliberately and narrowly. It avoids de
 
 State types used with `SimulationEngine<State, Input>` must remain copyable because snapshots are captured and restored by value.
 
+### `SystemPhase`
+
+`SystemPhase` defines the fixed execution order used by the engine:
+
+- `PreUpdate`
+- `Update`
+- `PostUpdate`
+
+The existing `add_system(name, callback)` overload registers systems into `Update`. The phase-aware overload `add_system(SystemPhase, name, callback)` makes ordering intent explicit without adding a larger scheduling system.
+
 ### `DeterministicRng`
 
 `DeterministicRng` is a small step-local random source. The engine constructs it from a per-tick seed derived from the configured base seed and the tick number. Systems that need pseudorandom behavior are expected to consume this source through the step context rather than use ambient global randomness.
@@ -55,7 +65,7 @@ State types used with `SimulationEngine<State, Input>` must remain copyable beca
 - the validated simulation configuration
 - the simulation clock
 - the active simulation state value
-- the ordered list of registered systems
+- the ordered list of registered systems and their phase assignments
 
 The engine exposes the following execution entry points:
 
@@ -66,6 +76,8 @@ The engine exposes the following execution entry points:
 
 It also exposes:
 
+- `add_system(name, callback)` for `Update`-phase registration
+- `add_system(SystemPhase, name, callback)` for explicit phase selection
 - `capture_snapshot()`
 - `restore_snapshot()`
 
@@ -88,19 +100,21 @@ For each executed tick:
 2. The engine derives a per-tick seed from the configured base seed and tick number.
 3. A step-local deterministic random source is created from that per-tick seed.
 4. An `InputStepContext<Input>` or `StepContext` is created for that tick.
-5. Systems execute in registration order.
-6. The clock advances.
-7. The state's completed-tick metadata is updated.
+5. `PreUpdate` systems execute in registration order.
+6. `Update` systems execute in registration order.
+7. `PostUpdate` systems execute in registration order.
+8. The clock advances.
+9. The state's completed-tick metadata is updated.
 
-No dynamic scheduling occurs in the current implementation. Deterministic ordering depends on the registration sequence and on user code preserving deterministic behavior inside each callback.
+No dynamic scheduling occurs in the current implementation. Deterministic ordering depends on the fixed phase order, the registration sequence within each phase, and user code preserving deterministic behavior inside each callback.
 
 The step-local deterministic random source is shared across systems within the tick. Because systems execute in stable registration order, random draws remain reproducible as long as system logic and input sequencing remain unchanged.
 
-When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems are not modified, so continuation after restore uses the same update ordering as uninterrupted execution. The engine does not store a mutable RNG stream in the snapshot; continuing from a restored snapshot remains reproducible because each tick reconstructs its deterministic random source from the configured seed and tick number.
+When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems and their phase assignments are not modified, so continuation after restore uses the same update ordering as uninterrupted execution. The engine does not store a mutable RNG stream in the snapshot; continuing from a restored snapshot remains reproducible because each tick reconstructs its deterministic random source from the configured seed and tick number.
 
 ## Stable Ordering
 
-The system container is a simple ordered sequence. This is intentional.
+The system container is a simple ordered sequence with explicit phase tags. This is intentional.
 
 The repository does not currently attempt:
 
@@ -109,7 +123,7 @@ The repository does not currently attempt:
 - parallel execution
 - automatic rescheduling
 
-Those features can be valuable later, but they would complicate deterministic reasoning at this stage.
+Those features can be valuable later, but they would complicate deterministic reasoning at this stage. The current model keeps ordering transparent: phase first, registration order second.
 
 ## Template Boundary
 
