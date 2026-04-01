@@ -11,6 +11,8 @@ namespace {
 struct ResourceTickInput {
   std::uint64_t inbound_ore{0};
   std::uint64_t outbound_target{0};
+
+  bool operator==(const ResourceTickInput&) const = default;
 };
 
 struct ResourcePipelineState final : xenor::SimulationState {
@@ -90,6 +92,15 @@ auto make_engine(xenor::SimulationConfig::seed_type seed) {
   return engine;
 }
 
+template <typename Input>
+std::size_t count_events(const xenor::ReplayTrace<Input>& trace,
+                         xenor::ReplayEventKind kind) {
+  return static_cast<std::size_t>(std::count_if(
+      trace.events.begin(), trace.events.end(), [kind](const auto& event) {
+        return event.kind == kind;
+      }));
+}
+
 }  // namespace
 
 int main() {
@@ -103,6 +114,10 @@ int main() {
   auto uninterrupted = make_engine(seed);
   auto restored = make_engine(seed);
   auto repeated = make_engine(seed);
+
+  uninterrupted.enable_replay_capture();
+  restored.enable_replay_capture();
+  repeated.enable_replay_capture();
 
   uninterrupted.run_for_sequence(inputs);
   const auto uninterrupted_final = uninterrupted.capture_snapshot();
@@ -122,7 +137,9 @@ int main() {
 
   if (!identical(uninterrupted_final, repeated_final) ||
       !identical(first_continuation, replayed_continuation) ||
-      !identical(uninterrupted_final, replayed_continuation)) {
+      !identical(uninterrupted_final, replayed_continuation) ||
+      !(uninterrupted.replay_trace() == repeated.replay_trace()) ||
+      count_events(restored.replay_trace(), xenor::ReplayEventKind::SnapshotRestored) != 1) {
     std::cerr << "deterministic input replay check failed\n";
     return EXIT_FAILURE;
   }
@@ -142,6 +159,13 @@ int main() {
   std::cout << "finished_units: " << uninterrupted_final.state.finished_units << '\n';
   std::cout << "backlog: " << uninterrupted_final.state.backlog << '\n';
   std::cout << "random_checksum: " << uninterrupted_final.state.random_checksum << '\n';
+  std::cout << "trace_events: " << uninterrupted.replay_trace().events.size() << '\n';
+  std::cout << "trace_system_events: "
+            << count_events(uninterrupted.replay_trace(), xenor::ReplayEventKind::SystemExecuted)
+            << '\n';
+  std::cout << "trace_restore_events: "
+            << count_events(restored.replay_trace(), xenor::ReplayEventKind::SnapshotRestored)
+            << '\n';
 
   return EXIT_SUCCESS;
 }

@@ -25,6 +25,8 @@ struct PipelineState final : xenor::SimulationState {
 struct WorkloadInput {
   std::int64_t supply{0};
   std::int64_t demand{0};
+
+  bool operator==(const WorkloadInput&) const = default;
 };
 
 struct SeededInputState final : xenor::SimulationState {
@@ -148,6 +150,15 @@ xenor::InputSequence<WorkloadInput> make_workload_inputs() {
 xenor::InputSequence<WorkloadInput> make_variant_workload_inputs() {
   return xenor::InputSequence<WorkloadInput>{
       {{3, 1}, {1, 4}, {2, 2}, {2, 6}, {5, 3}, {1, 1}, {4, 4}, {2, 1}}};
+}
+
+template <typename Input>
+std::size_t count_events(const xenor::ReplayTrace<Input>& trace,
+                         xenor::ReplayEventKind kind) {
+  return static_cast<std::size_t>(std::count_if(
+      trace.events.begin(), trace.events.end(), [kind](const auto& event) {
+        return event.kind == kind;
+      }));
 }
 
 }  // namespace
@@ -431,6 +442,107 @@ TEST_CASE("Identical seeds and identical input sequences produce identical final
   second.run_for_sequence(inputs);
 
   REQUIRE(identical(first.capture_snapshot(), second.capture_snapshot()));
+}
+
+TEST_CASE("Identical runs produce identical replay traces",
+          "[determinism][replay][trace]") {
+  const auto inputs = make_workload_inputs();
+
+  auto first = make_seeded_input_engine(41);
+  auto second = make_seeded_input_engine(41);
+
+  first.enable_replay_capture();
+  second.enable_replay_capture();
+
+  first.run_for_sequence(inputs);
+  second.run_for_sequence(inputs);
+
+  REQUIRE(identical(first.capture_snapshot(), second.capture_snapshot()));
+  REQUIRE(first.replay_trace() == second.replay_trace());
+  REQUIRE(first.replay_trace().seed == 41);
+}
+
+TEST_CASE("Different input sequences produce different replay traces where input events differ",
+          "[determinism][replay][trace]") {
+  auto first = make_seeded_input_engine(41);
+  auto second = make_seeded_input_engine(41);
+
+  first.enable_replay_capture();
+  second.enable_replay_capture();
+
+  first.run_for_sequence(make_workload_inputs());
+  second.run_for_sequence(make_variant_workload_inputs());
+
+  REQUIRE_FALSE(first.replay_trace() == second.replay_trace());
+}
+
+TEST_CASE("Snapshot restore events are recorded in the replay trace",
+          "[snapshot][replay][trace]") {
+  auto engine = make_pipeline_engine();
+  engine.enable_replay_capture();
+
+  engine.run_for_ticks(4);
+  const auto checkpoint = engine.capture_snapshot();
+
+  engine.run_for_ticks(2);
+  engine.restore_snapshot(checkpoint);
+
+  const auto& trace = engine.replay_trace();
+
+  REQUIRE(count_events(trace, xenor::ReplayEventKind::SnapshotRestored) == 1);
+  REQUIRE(trace.events.back().kind == xenor::ReplayEventKind::SnapshotRestored);
+  REQUIRE(trace.events.back().tick == checkpoint.tick);
+  REQUIRE(trace.events.back().elapsed == checkpoint.elapsed);
+}
+
+TEST_CASE("Phased execution markers appear in deterministic order in replay traces",
+          "[engine][phase][replay][trace]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 21}};
+  engine.add_system(xenor::SystemPhase::PostUpdate,
+                    "post",
+                    [](CounterState&, const xenor::StepContext&) {});
+  engine.add_system(xenor::SystemPhase::Update,
+                    "update",
+                    [](CounterState&, const xenor::StepContext&) {});
+  engine.add_system(xenor::SystemPhase::PreUpdate,
+                    "pre",
+                    [](CounterState&, const xenor::StepContext&) {});
+
+  engine.enable_replay_capture();
+  engine.step();
+
+  const auto& trace = engine.replay_trace();
+  std::vector<std::string> system_markers;
+  for (const auto& event : trace.events) {
+    if (event.kind != xenor::ReplayEventKind::SystemExecuted) {
+      continue;
+    }
+
+    system_markers.push_back(
+        std::to_string(static_cast<int>(event.phase)) + ":" + event.system_name);
+  }
+
+  const std::vector<std::string> expected{
+      "0:pre", "1:update", "2:post"};
+  REQUIRE(system_markers == expected);
+}
+
+TEST_CASE("Replay trace capture does not alter engine behavior",
+          "[determinism][replay][trace]") {
+  const auto inputs = make_workload_inputs();
+
+  auto traced = make_seeded_input_engine(41);
+  auto untraced = make_seeded_input_engine(41);
+
+  traced.enable_replay_capture();
+
+  traced.run_for_sequence(inputs);
+  untraced.run_for_sequence(inputs);
+
+  REQUIRE(identical(traced.capture_snapshot(), untraced.capture_snapshot()));
+  REQUIRE_FALSE(traced.replay_trace().empty());
 }
 
 TEST_CASE("Different seeds produce different final states when seeded behavior is used",
