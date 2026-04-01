@@ -156,7 +156,22 @@ public:
   void restore_snapshot_boundary(const SnapshotBoundary<Payload>& boundary,
                                  Adapter& adapter) {
     validate_snapshot_boundary_metadata(boundary.metadata, config_);
-    restore_snapshot(restore_snapshot_from_boundary<State>(boundary, adapter));
+    const auto restored_snapshot = restore_snapshot_from_boundary<State>(boundary, adapter);
+
+    if (restored_snapshot.tick != boundary.metadata.tick ||
+        restored_snapshot.elapsed != boundary.metadata.elapsed ||
+        restored_snapshot.seed != boundary.metadata.seed ||
+        restored_snapshot.state.last_completed_tick() != boundary.metadata.state_last_completed_tick) {
+      throw_snapshot_boundary_error(
+          SnapshotBoundaryErrorCode::InvalidStateMetadata,
+          "snapshot boundary restore produced a snapshot that does not match "
+          "the validated boundary metadata");
+    }
+
+    clock_.restore(restored_snapshot.tick);
+    state_ = restored_snapshot.state;
+    record_replay_event(replay_trace_type::event_type::snapshot_restored(
+        restored_snapshot.tick, restored_snapshot.elapsed));
   }
 
 private:
