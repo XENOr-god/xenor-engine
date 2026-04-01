@@ -13,8 +13,10 @@ Within the current design, `xenor-engine` guarantees:
 - engine time is derived from tick count rather than wall-clock time
 - per-tick random state is derived deterministically from the configured seed and tick number
 - snapshots capture deterministic clock metadata, the configured seed, and state
+- snapshot boundaries expose deterministic snapshot metadata plus a user-defined payload projection path
 - replay traces record deterministic execution events when replay capture is enabled
 - restoring a captured snapshot re-establishes the captured tick, seed contract, and state
+- restoring through a snapshot boundary reuses the same restore compatibility checks as direct snapshot restore
 - restore-and-continue execution uses the same registered system order as uninterrupted execution
 - repeated runs with identical initial state, configuration, seed, system set, phase registration, and input sequence produce identical results and identical replay traces
 
@@ -107,6 +109,19 @@ Restore semantics are intentionally strict:
 
 The current implementation uses these checks to reject incompatible snapshots rather than attempt implicit correction.
 
+Snapshot serialization boundaries extend that model without changing it. The engine can project a valid in-memory snapshot into:
+
+- deterministic engine metadata in `SnapshotBoundaryMetadata`
+- a user-defined payload in `SnapshotBoundary<Payload>`
+
+This boundary is useful for:
+
+- making snapshot compatibility metadata explicit
+- preparing future persistence work without choosing an encoding
+- testing payload projection and reconstruction paths independently from storage concerns
+
+The boundary does not serialize arbitrary state automatically. Deterministic behavior still depends on the adapter being deterministic and on the payload capturing all user-defined state required for restore. The engine validates boundary metadata, but it does not verify that an adapter payload is semantically complete beyond reconstructing a `State` value that satisfies the normal snapshot restore checks.
+
 Replay in the current repository means deterministic re-execution under identical initial state, configuration, seed, phase-ordered systems, and inputs, or deterministic continuation after restoring a snapshot and replaying the remaining input sequence. Replay traces provide an in-memory execution summary for that process, but there is no serialized replay log, event stream export, or file-based input capture yet.
 
-Replay logs, serialized state, and input capture are out of scope for the initial repository version.
+Replay logs, encoded snapshot formats, persistent storage, and file-based input capture are out of scope for the current repository version.

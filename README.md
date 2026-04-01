@@ -18,6 +18,7 @@ The current repository provides:
 - user-owned simulation state with deterministic tick metadata
 - tick-scoped deterministic random number generation
 - snapshot capture and restore
+- explicit snapshot serialization boundaries
 - deterministic restore-and-continue validation
 - one runnable deterministic example
 - baseline unit tests
@@ -34,6 +35,7 @@ The current repository provides:
 - deterministic execution inspection through replay event traces
 - stable and inspectable update ordering
 - snapshot restore without hidden runtime state
+- explicit snapshot projection boundaries without engine-owned state serialization
 - architecture that supports replay validation and future replay-oriented features
 - baseline benchmarking support
 - small dependency surface
@@ -75,6 +77,8 @@ The engine is organized around a small set of core types:
   owns the clock, the active state value, and the ordered system list
 - `SimulationSnapshot<State>`
   captures tick, elapsed simulated time, the configured seed, and a copy of the current state
+- `SnapshotBoundaryMetadata`, `SnapshotBoundary<Payload>`, `SnapshotStateAdapter`
+  define the engine metadata and user-owned payload boundary for future snapshot persistence work
 
 Systems are registered explicitly and execute in registration order. The engine does not perform any dynamic scheduling or wall-clock based stepping.
 Systems execute in fixed phase order: `PreUpdate`, `Update`, then `PostUpdate`. Within a phase, execution order remains registration-based. Systems added through the existing `add_system(name, callback)` overload default to the `Update` phase.
@@ -83,6 +87,7 @@ State types used with `SimulationEngine<State, Input>` must be copyable. Snapsho
 
 Input-aware engines consume one explicit input value per executed tick. For each tick, the engine derives a step seed from the configured base seed and tick number, then exposes a deterministic random source through the step context.
 Replay capture is optional and in-memory. When enabled, the engine records deterministic tick start, input applied, system executed, tick completed, and snapshot restored events into a `ReplayTrace<Input>`.
+Snapshot boundary projection is explicit. The engine owns deterministic snapshot metadata, while user code owns conversion between simulation state and any boundary payload type.
 
 Additional design notes are documented in [docs/architecture.md](docs/architecture.md) and [docs/determinism.md](docs/determinism.md).
 
@@ -102,7 +107,9 @@ The current implementation follows these rules:
 - each executed tick receives a deterministic random source derived from the configured seed and tick number
 - replay event order is deterministic when replay capture is enabled
 - snapshots are copies of deterministic state plus clock metadata
+- snapshot boundary metadata is deterministic when derived from a valid snapshot
 - restoring a captured snapshot restores the exact tick, elapsed time, configured seed, and state value
+- restoring through a snapshot boundary requires the same engine configuration and a user-defined payload restore path
 - repeated runs with identical initial state, configuration, seed, inputs, phase registration, and system logic should produce identical results and identical replay traces
 
 This does not remove all sources of nondeterminism from user code. Callbacks can still introduce nondeterministic behavior if they read wall-clock time, use unstable containers for externally visible ordering, depend on nondeterministic external input, bypass the step-local deterministic random source, or rely on undefined behavior. Replay traces reflect those choices; they do not compensate for them.
@@ -119,15 +126,16 @@ What exists today:
 - deterministic per-tick input sequencing through `InputSequence<Input>` and `run_for_sequence()`
 - optional replay traces through `enable_replay_capture()` and `replay_trace()`
 - snapshot capture and restore
+- snapshot boundary projection through `capture_snapshot_boundary()` and `restore_snapshot_boundary()`
 - tick-scoped deterministic random number generation through the step context
-- deterministic resource-pipeline example with phased execution, seed reuse, input sequencing, replay-trace summaries, and restore-and-continue validation
-- unit tests for tick progression, phase ordering, seed handling, input sequencing, replay traces, snapshot capture and restore, and repeatability
+- deterministic resource-pipeline example with phased execution, seed reuse, input sequencing, replay-trace summaries, snapshot-boundary inspection, and restore-and-continue validation
+- unit tests for tick progression, phase ordering, seed handling, input sequencing, replay traces, snapshot capture and restore, snapshot-boundary validation, and repeatability
 - benchmark target for repeated tick execution
 - Linux CI for configure, build, and test
 
 What does not exist yet:
 
-- serialization or persistence
+- snapshot encoding formats or persistence
 - replay logs
 - state diffing
 - rollback support
@@ -177,7 +185,7 @@ Build and run the example:
 ```
 
 The example runs a deterministic four-stage resource pipeline, captures a mid-run snapshot, continues execution, restores the snapshot, and verifies that the replayed continuation matches the uninterrupted run.
-It uses explicit `PreUpdate`, `Update`, and `PostUpdate` phases, an explicit per-tick input sequence, a configured seed, and a tick-scoped deterministic random source. It enables replay capture, compares repeated traces for equality, and prints a compact trace summary.
+It uses explicit `PreUpdate`, `Update`, and `PostUpdate` phases, an explicit per-tick input sequence, a configured seed, and a tick-scoped deterministic random source. It enables replay capture, compares repeated traces for equality, projects a snapshot through an explicit boundary payload adapter, and prints a compact trace summary.
 
 ## Minimal API Sketch
 
@@ -191,6 +199,22 @@ struct State final : xenor::SimulationState {
 
 struct TickInput {
   std::uint64_t delta{0};
+};
+
+struct SnapshotPayload {
+  std::uint64_t counter{0};
+};
+
+struct SnapshotAdapter {
+  using payload_type = SnapshotPayload;
+
+  payload_type capture(const State& state) { return SnapshotPayload{state.counter}; }
+
+  State restore(const payload_type& payload) {
+    State state;
+    state.counter = payload.counter;
+    return state;
+  }
 };
 
 int main() {
@@ -215,9 +239,12 @@ int main() {
   const xenor::InputSequence<TickInput> inputs{{{1}, {2}, {3}}};
   engine.run_for_sequence(inputs);
   const auto snapshot = engine.capture_snapshot();
+  SnapshotAdapter adapter;
+  const auto boundary = engine.capture_snapshot_boundary(adapter);
   const auto event_count = engine.replay_trace().events.size();
 
   engine.restore_snapshot(snapshot);
+  engine.restore_snapshot_boundary(boundary, adapter);
   static_cast<void>(event_count);
 }
 ```
@@ -243,7 +270,6 @@ int main() {
 
 ## Roadmap
 
-- add snapshot serialization boundaries
 - add more representative benchmark scenarios
 - add state inspection helpers for larger workloads
 - evaluate scheduling extensions without weakening ordering guarantees
@@ -254,6 +280,7 @@ int main() {
 - Keep seeds and per-tick inputs explicit at the engine boundary.
 - Use phases to separate preparation, state mutation, and derived-state work when that structure clarifies deterministic ordering.
 - Use the step-context random source instead of ambient global randomness when repeatability matters.
+- Keep snapshot payload conversion explicit in user code rather than hiding it behind engine-owned serialization.
 - Use replay traces for inspection and regression validation, not as a persistence format.
 - Keep system callbacks small and explicit.
 - Treat benchmark results as workload-specific observations, not universal claims.

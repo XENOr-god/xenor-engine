@@ -101,6 +101,8 @@ It also exposes:
 - `replay_trace()`
 - `capture_snapshot()`
 - `restore_snapshot()`
+- `capture_snapshot_boundary()`
+- `restore_snapshot_boundary()`
 
 ### `SimulationSnapshot<State>`
 
@@ -112,6 +114,28 @@ It also exposes:
 - a copy of the simulation state
 
 Snapshots can be restored back into a compatible engine instance. Compatibility is intentionally narrow: restore expects snapshot clock metadata and snapshot seed to match the engine configuration, and expects state tick metadata to match the captured tick.
+
+### `SnapshotBoundaryMetadata`, `SnapshotBoundary<Payload>`, and `SnapshotStateAdapter`
+
+Snapshot serialization boundaries are represented with three small pieces:
+
+- `SnapshotBoundaryMetadata`
+- `SnapshotBoundary<Payload>`
+- `SnapshotStateAdapter`
+
+`SnapshotBoundaryMetadata` carries the engine-owned deterministic metadata required to re-establish a compatible snapshot boundary:
+
+- current tick
+- elapsed simulated time
+- configured seed
+- state last-completed-tick metadata
+
+`SnapshotBoundary<Payload>` combines that metadata with a user-defined payload value. The engine does not infer how arbitrary user state should become a payload. `SnapshotStateAdapter` makes that responsibility explicit through two operations:
+
+- `capture(const State&) -> payload_type`
+- `restore(const payload_type&) -> State`
+
+The engine-level metadata remains separate from the payload so future persistence work can keep compatibility checks explicit without forcing a storage format into the core library.
 
 ## Update Flow
 
@@ -136,6 +160,10 @@ No dynamic scheduling occurs in the current implementation. Deterministic orderi
 The step-local deterministic random source is shared across systems within the tick. Because systems execute in stable registration order, random draws remain reproducible as long as system logic and input sequencing remain unchanged. Replay event order follows the same deterministic structure.
 
 When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems and their phase assignments are not modified, so continuation after restore uses the same update ordering as uninterrupted execution. The engine does not store a mutable RNG stream in the snapshot; continuing from a restored snapshot remains reproducible because each tick reconstructs its deterministic random source from the configured seed and tick number. If replay capture is enabled, restore also records a `SnapshotRestored` event.
+
+Snapshot boundary projection sits beside that restore path. `capture_snapshot_boundary()` first captures a normal `SimulationSnapshot<State>`, derives `SnapshotBoundaryMetadata` from it, and then delegates user-state payload extraction to the provided adapter. `restore_snapshot_boundary()` validates the boundary metadata against the engine configuration before reconstructing a `SimulationSnapshot<State>` through the adapter and restoring it through the normal snapshot path.
+
+The engine treats `SimulationState` metadata as engine-owned. Adapters are responsible for the user-defined state payload; the engine restores `last_completed_tick` from boundary metadata after adapter reconstruction so payload code does not need to duplicate engine metadata handling.
 
 ## Stable Ordering
 
@@ -174,6 +202,6 @@ The benchmark target exists to make changes measurable from the beginning.
 
 Natural next steps include:
 
-- serialized snapshots
+- encoded snapshot formats built on the explicit boundary types
 - larger benchmark workloads
 - optional scheduling extensions with explicit ordering semantics
