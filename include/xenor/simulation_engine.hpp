@@ -19,7 +19,7 @@
 namespace xenor {
 
 template <typename State>
-concept EngineState = std::derived_from<State, SimulationState> && std::copy_constructible<State>;
+concept EngineState = std::derived_from<State, SimulationState> && std::copyable<State>;
 
 template <EngineState State>
 class SimulationEngine {
@@ -28,6 +28,9 @@ public:
   using tick_type = SimulationClock::tick_type;
   using duration_type = SimulationConfig::duration_type;
   using system_type = std::function<void(State&, const StepContext&)>;
+
+  static_assert(std::copyable<State>,
+                "SimulationEngine state must be copyable for snapshot capture and restore.");
 
   explicit SimulationEngine(SimulationConfig config, State initial_state = {})
       : config_(std::move(config)), clock_(config_), state_(std::move(initial_state)) {
@@ -92,7 +95,7 @@ public:
     }
   }
 
-  [[nodiscard]] SimulationSnapshot<State> snapshot() const {
+  [[nodiscard]] SimulationSnapshot<State> capture_snapshot() const {
     return SimulationSnapshot<State>{
         .tick = clock_.current_tick(),
         .elapsed = clock_.elapsed_duration(),
@@ -100,11 +103,31 @@ public:
     };
   }
 
+  [[nodiscard]] SimulationSnapshot<State> snapshot() const { return capture_snapshot(); }
+
+  void restore_snapshot(const SimulationSnapshot<State>& snapshot) {
+    validate_snapshot(snapshot);
+    clock_.restore(snapshot.tick);
+    state_ = snapshot.state;
+  }
+
 private:
   struct RegisteredSystem {
     std::string name;
     system_type callback;
   };
+
+  void validate_snapshot(const SimulationSnapshot<State>& snapshot) const {
+    if (snapshot.elapsed != clock_.elapsed_duration_at(snapshot.tick)) {
+      throw std::invalid_argument(
+          "snapshot elapsed duration does not match the engine configuration");
+    }
+
+    if (snapshot.state.last_completed_tick() != snapshot.tick) {
+      throw std::invalid_argument(
+          "snapshot state metadata does not match the captured tick");
+    }
+  }
 
   SimulationConfig config_;
   SimulationClock clock_;

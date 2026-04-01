@@ -62,6 +62,11 @@ void SimulationClock::advance_by(tick_type steps) {
   current_tick_ += steps;
 }
 
+void SimulationClock::restore(tick_type tick) {
+  static_cast<void>(elapsed_duration_at(tick));
+  current_tick_ = tick;
+}
+
 void SimulationClock::reset() noexcept {
   current_tick_ = 0;
 }

@@ -20,6 +20,7 @@ public:
 
   void advance();
   void advance_by(tick_type steps);
+  void restore(tick_type tick);
   void reset() noexcept;
 
 private:
