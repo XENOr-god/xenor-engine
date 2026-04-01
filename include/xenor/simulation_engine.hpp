@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "xenor/input_sequence.hpp"
+#include "xenor/replay_trace.hpp"
 #include "xenor/simulation_clock.hpp"
 #include "xenor/simulation_config.hpp"
 #include "xenor/simulation_snapshot.hpp"
@@ -33,14 +34,18 @@ public:
   using seed_type = SimulationConfig::seed_type;
   using phase_type = SystemPhase;
   using step_context_type = InputStepContext<Input>;
+  using replay_trace_type = ReplayTrace<Input>;
   using system_type = std::function<void(State&, const step_context_type&)>;
 
   static_assert(std::copyable<State>,
                 "SimulationEngine state must be copyable for snapshot capture and restore.");
+  static_assert(std::same_as<Input, NoInput> || std::copy_constructible<Input>,
+                "SimulationEngine input must be copy constructible for replay trace capture.");
 
   explicit SimulationEngine(SimulationConfig config, State initial_state = {})
       : config_(std::move(config)), clock_(config_), state_(std::move(initial_state)) {
     state_.set_last_completed_tick(clock_.current_tick());
+    replay_trace_.seed = config_.seed();
   }
 
   [[nodiscard]] const SimulationConfig& config() const noexcept { return config_; }
@@ -48,6 +53,20 @@ public:
   [[nodiscard]] const State& state() const noexcept { return state_; }
   [[nodiscard]] State& state() noexcept { return state_; }
   [[nodiscard]] seed_type seed() const noexcept { return config_.seed(); }
+  [[nodiscard]] bool replay_capture_enabled() const noexcept { return replay_capture_enabled_; }
+  [[nodiscard]] const replay_trace_type& replay_trace() const noexcept { return replay_trace_; }
+
+  void enable_replay_capture() {
+    replay_capture_enabled_ = true;
+    clear_replay_trace();
+  }
+
+  void disable_replay_capture() noexcept { replay_capture_enabled_ = false; }
+
+  void clear_replay_trace() {
+    replay_trace_.seed = config_.seed();
+    replay_trace_.clear();
+  }
 
   std::size_t add_system(std::string name, system_type system) {
     return add_system(phase_type::Update, std::move(name), std::move(system));
@@ -119,6 +138,8 @@ public:
     validate_snapshot(snapshot);
     clock_.restore(snapshot.tick);
     state_ = snapshot.state;
+    record_replay_event(replay_trace_type::event_type::snapshot_restored(
+        snapshot.tick, snapshot.elapsed));
   }
 
 private:
@@ -147,23 +168,52 @@ private:
         &step_rng,
     };
 
+    record_replay_event(
+        replay_trace_type::event_type::tick_started(next_tick, context.elapsed, step_seed));
+
+    if constexpr (!std::same_as<Input, NoInput>) {
+      record_replay_input(context.tick, context.elapsed, input);
+    }
+
     for (const auto phase : ordered_system_phases()) {
       for (const auto& system : systems_) {
         if (system.phase != phase) {
           continue;
         }
 
+        record_replay_event(replay_trace_type::event_type::system_executed(
+            context.tick, context.elapsed, system.phase, system.name));
         system.callback(state_, context);
       }
     }
 
     clock_.advance();
     state_.set_last_completed_tick(clock_.current_tick());
+    record_replay_event(replay_trace_type::event_type::tick_completed(
+        clock_.current_tick(), clock_.elapsed_duration()));
   }
 
   [[nodiscard]] static seed_type derive_step_seed(seed_type seed, tick_type tick) noexcept {
     return DeterministicRng::mix(
         seed + 0x9e3779b97f4a7c15ULL * static_cast<seed_type>(tick));
+  }
+
+  void record_replay_event(typename replay_trace_type::event_type event) {
+    if (!replay_capture_enabled_) {
+      return;
+    }
+
+    replay_trace_.events.push_back(std::move(event));
+  }
+
+  void record_replay_input(tick_type tick, duration_type elapsed, const Input* input)
+      requires (!std::same_as<Input, NoInput>) {
+    if (!replay_capture_enabled_ || input == nullptr) {
+      return;
+    }
+
+    replay_trace_.events.push_back(
+        replay_trace_type::event_type::input_applied(tick, elapsed, *input));
   }
 
   void validate_snapshot(const SimulationSnapshot<State>& snapshot) const {
@@ -185,6 +235,8 @@ private:
   SimulationConfig config_;
   SimulationClock clock_;
   State state_;
+  replay_trace_type replay_trace_{};
+  bool replay_capture_enabled_{false};
   std::vector<RegisteredSystem> systems_;
 };
 

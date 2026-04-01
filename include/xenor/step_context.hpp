@@ -8,7 +8,9 @@
 
 namespace xenor {
 
-struct NoInput final {};
+struct NoInput final {
+  bool operator==(const NoInput&) const = default;
+};
 
 template <typename Input = NoInput>
 class InputStepContext {

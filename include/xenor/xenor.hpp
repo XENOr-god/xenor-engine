@@ -2,6 +2,7 @@
 
 #include "xenor/deterministic_rng.hpp"
 #include "xenor/input_sequence.hpp"
+#include "xenor/replay_trace.hpp"
 #include "xenor/simulation_clock.hpp"
 #include "xenor/simulation_config.hpp"
 #include "xenor/simulation_engine.hpp"
