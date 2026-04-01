@@ -1,301 +1,184 @@
 # xenor-engine
 
-`xenor-engine` is a C++20 deterministic simulation engine for fixed-timestep workloads.
+`xenor-engine` is a C++20 deterministic fixed-timestep simulation core for workloads that need repeatable state evolution, explicit tick progression, and replay-oriented validation.
 
-The repository is intended as a disciplined foundation for systems, protocol, mechanism, and economic simulation work where explicit state evolution and repeatable execution matter more than feature breadth.
+It is intentionally narrow. The repository provides a small engine substrate for simulation work where deterministic behavior matters more than feature breadth.
 
-## Project Scope
+## What It Is
 
-The current repository provides:
+- a deterministic simulation core with integer tick progression
+- explicit fixed-timestep execution through `SimulationConfig` and `SimulationClock`
+- explicit seed handling, per-tick input sequencing, and fixed phase ordering
+- snapshot capture and restore with version-aware snapshot boundaries
+- replay-oriented inspection through in-memory trace capture
 
-- a small reusable engine core
-- explicit fixed-timestep execution
-- explicit seed handling in simulation configuration
-- stable system registration and update ordering
-- fixed phased system execution
-- deterministic per-tick input sequencing
-- optional in-memory replay event capture
-- user-owned simulation state with deterministic tick metadata
-- tick-scoped deterministic random number generation
-- snapshot capture and restore
-- explicit snapshot serialization boundaries
-- explicit snapshot boundary version semantics
-- explicit snapshot boundary restore diagnostics
-- deterministic restore-and-continue validation
-- one runnable deterministic example
-- baseline unit tests
-- one benchmark target for tick execution throughput
+## What It Is Not
 
-## Design Goals
+- a persistence layer
+- a serializer framework
+- a built-in JSON, binary, or text snapshot format
+- an engine-owned payload migration system
+- a game framework, rendering stack, networking runtime, or ECS
 
-- deterministic execution from identical initial state, configuration, seed, and input sequence
-- fixed-timestep progression in integer ticks
-- explicit state transitions
-- explicit seed handling with no hidden global randomness
-- deterministic per-tick input application
-- deterministic execution structure through fixed system phases
-- deterministic execution inspection through replay event traces
-- stable and inspectable update ordering
-- snapshot restore without hidden runtime state
-- explicit snapshot projection boundaries without engine-owned state serialization
-- explicit separation between engine-owned boundary versioning and user-owned payload versioning
-- explicit, distinguishable snapshot boundary restore failures
-- architecture that supports replay validation and future replay-oriented features
-- baseline benchmarking support
-- small dependency surface
+## Getting Started
 
-## Non-Goals
+Requirements:
 
-`xenor-engine` is not:
+- CMake 3.24 or newer
+- a C++20 compiler
 
-- a game engine
-- a rendering or graphics stack
-- a GUI framework
-- a networking runtime
-- an ECS framework
-- a full protocol simulator
+Fastest first run:
 
-The initial implementation is intentionally narrow. It focuses on the engine substrate rather than domain-specific models.
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DXENOR_ENGINE_BUILD_TESTS=OFF -DXENOR_ENGINE_BUILD_BENCHMARKS=OFF
+cmake --build build --parallel
+./build/examples/xenor_engine_resource_pipeline_example
+```
 
-## Architecture Overview
+This builds the library and the example without test or benchmark dependencies. The example exits with a non-zero status if its deterministic checks fail.
 
-The engine is organized around a small set of core types:
-
-- `SimulationConfig`
-  holds the fixed tick duration and base deterministic seed
-- `SimulationClock`
-  tracks integer tick progression and derived simulated time
-- `SimulationState`
-  provides deterministic tick metadata for user-defined state objects
-- `SystemPhase`
-  defines the fixed execution order `PreUpdate`, `Update`, `PostUpdate`
-- `DeterministicRng`
-  provides a small deterministic random source for step-local use
-- `InputSequence<Input>`
-  stores explicit per-tick inputs in tick order
-- `ReplayEventKind`, `ReplayEvent<Input>`, `ReplayTrace<Input>`
-  model deterministic in-memory replay traces
-- `InputStepContext<Input>` / `StepContext`
-  passes tick-local execution data, seed data, and optional input access to systems
-- `SimulationEngine<State, Input>`
-  owns the clock, the active state value, and the ordered system list
-- `SimulationSnapshot<State>`
-  captures tick, elapsed simulated time, the configured seed, and a copy of the current state
-- `SnapshotBoundaryMetadata`, `SnapshotBoundary<Payload>`, `SnapshotStateAdapter`,
-  `SnapshotBoundaryErrorCode`, `SnapshotBoundaryError`
-  define the engine metadata, engine-owned boundary version, payload version, adapter contract, and restore diagnostics for future snapshot persistence work
-
-Systems are registered explicitly and execute in registration order. The engine does not perform any dynamic scheduling or wall-clock based stepping.
-Systems execute in fixed phase order: `PreUpdate`, `Update`, then `PostUpdate`. Within a phase, execution order remains registration-based. Systems added through the existing `add_system(name, callback)` overload default to the `Update` phase.
-
-State types used with `SimulationEngine<State, Input>` must be copyable. Snapshot capture and restore operate on value copies of the active state.
-
-Input-aware engines consume one explicit input value per executed tick. For each tick, the engine derives a step seed from the configured base seed and tick number, then exposes a deterministic random source through the step context.
-Replay capture is optional and in-memory. When enabled, the engine records deterministic tick start, input applied, system executed, tick completed, and snapshot restored events into a `ReplayTrace<Input>`.
-Snapshot boundary projection is explicit. The engine owns deterministic snapshot metadata and the boundary engine version, while user code owns payload conversion, payload version selection, and any payload migration behavior.
-
-Additional design notes are documented in [docs/architecture.md](docs/architecture.md) and [docs/determinism.md](docs/determinism.md).
-
-## Determinism Philosophy
-
-The repository treats determinism as a design constraint rather than an optional runtime mode.
-
-The current implementation follows these rules:
-
-- tick duration is configured explicitly and must be positive
-- the base deterministic seed is configured explicitly
-- engine time advances in integer ticks only
-- the engine never reads wall-clock time
-- per-tick inputs are applied in explicit sequence order
-- phase order is fixed and explicit
-- system execution order within each phase is stable and explicit
-- each executed tick receives a deterministic random source derived from the configured seed and tick number
-- replay event order is deterministic when replay capture is enabled
-- snapshots are copies of deterministic state plus clock metadata
-- snapshot boundary metadata is deterministic when derived from a valid snapshot
-- snapshot boundary restore rejects incompatible engine boundary versions before payload restore occurs
-- restoring a captured snapshot restores the exact tick, elapsed time, configured seed, and state value
-- restoring through a snapshot boundary requires the same engine configuration and explicit adapter support for the captured payload version
-- snapshot boundary restore failures are reported with boundary-specific error codes
-- repeated runs with identical initial state, configuration, seed, inputs, phase registration, and system logic should produce identical results and identical replay traces
-
-This does not remove all sources of nondeterminism from user code. Callbacks can still introduce nondeterministic behavior if they read wall-clock time, use unstable containers for externally visible ordering, depend on nondeterministic external input, bypass the step-local deterministic random source, or rely on undefined behavior. Replay traces reflect those choices; they do not compensate for them.
-
-## Current Implementation Status
-
-The repository is a first credible foundation, not a complete framework.
-
-What exists today:
-
-- core fixed-timestep engine library
-- explicit seed handling through `SimulationConfig`
-- phased system registration through `SystemPhase` and `add_system(SystemPhase, ...)`
-- deterministic per-tick input sequencing through `InputSequence<Input>` and `run_for_sequence()`
-- optional replay traces through `enable_replay_capture()` and `replay_trace()`
-- snapshot capture and restore
-- snapshot boundary projection through `capture_snapshot_boundary()` and `restore_snapshot_boundary()`
-- explicit snapshot boundary version checks with adapter-owned payload compatibility decisions
-- boundary-specific restore diagnostics through `SnapshotBoundaryError`
-- tick-scoped deterministic random number generation through the step context
-- deterministic resource-pipeline example with phased execution, seed reuse, input sequencing, replay-trace summaries, snapshot-boundary inspection, version-aware restore, and restore-and-continue validation
-- unit tests for tick progression, phase ordering, seed handling, input sequencing, replay traces, snapshot capture and restore, snapshot-boundary version validation, and repeatability
-- benchmark target for repeated tick execution
-- Linux CI for configure, build, and test
-
-What does not exist yet:
-
-- snapshot encoding formats or persistence
-- replay logs
-- state diffing
-- rollback support
-- parallel scheduling
-- domain-specific simulation models
-
-## Build Instructions
-
-The project uses CMake and requires a C++20 compiler.
-
-Configure:
+Full validation build:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-```
-
-Build:
-
-```bash
 cmake --build build --parallel
-```
-
-The current CMake configuration fetches Catch2 and Google Benchmark during configuration when tests and benchmarks are enabled.
-
-## Test Instructions
-
-```bash
 ctest --test-dir build --output-on-failure
 ```
 
-## Benchmark Instructions
+When tests or benchmarks are enabled, the configure step fetches Catch2 and Google Benchmark.
 
-Build the benchmark target as part of the normal build, then run:
+## First Example To Run
 
-```bash
-./build/benchmarks/xenor_engine_benchmarks
-```
+The best first executable is [`examples/resource_pipeline_example.cpp`](examples/resource_pipeline_example.cpp).
 
-The benchmark is intentionally small. It exists to establish a baseline measurement path rather than provide authoritative performance claims.
+It demonstrates:
 
-## Example Usage
+- fixed phase ordering through `PreUpdate`, `Update`, and `PostUpdate`
+- explicit per-tick input sequencing
+- deterministic seed handling and tick-scoped RNG use
+- replay trace comparison across repeated runs
+- snapshot capture, restore, and restore-and-continue validation
+- version-aware snapshot boundaries with adapter-owned payload migration
 
-Build and run the example:
+Run it with:
 
 ```bash
 ./build/examples/xenor_engine_resource_pipeline_example
 ```
 
-The example runs a deterministic four-stage resource pipeline, captures a mid-run snapshot, continues execution, restores the snapshot, and verifies that the replayed continuation matches the uninterrupted run.
-It uses explicit `PreUpdate`, `Update`, and `PostUpdate` phases, an explicit per-tick input sequence, a configured seed, and a tick-scoped deterministic random source. It enables replay capture, compares repeated traces for equality, projects a snapshot through an explicit boundary payload adapter, restores from the current payload version, and demonstrates an explicit adapter-owned legacy payload migration path.
+If you want the smallest possible control flow first, read the minimal example below before reading the resource-pipeline example.
 
-## Snapshot Boundary Failures
-
-Snapshot boundary restore now reports boundary-specific failures through `SnapshotBoundaryError` and `SnapshotBoundaryErrorCode`.
-
-Restore failures are separated into:
-
-- `IncompatibleEngineVersion`
-  The boundary was produced by a different engine-owned boundary contract. Recreate the boundary with a compatible engine version.
-- `InvalidStateMetadata`
-  Boundary state metadata is internally inconsistent, or the restored state does not match authoritative engine metadata. Verify the boundary metadata and do not let adapters own `last_completed_tick`.
-- `IncompatibleElapsedDuration`
-  Boundary time metadata does not match the restoring engine configuration. Restore with the same fixed-timestep configuration used to capture the boundary.
-- `IncompatibleSeed`
-  Boundary seed metadata does not match the restoring engine configuration. Restore with the matching deterministic seed.
-- `UnsupportedPayloadVersion`
-  The adapter does not accept the captured payload version. Use a matching adapter version or implement explicit migration in the adapter.
-- `AdapterContractViolation`
-  The adapter reports an inconsistent payload-version contract, such as declaring a payload version it does not support. Fix the adapter implementation.
-- `AdapterRestoreFailure`
-  The adapter accepted the payload version but failed while reconstructing state. Review payload completeness and version-specific restore logic.
-
-## Minimal API Sketch
+## Smallest Example
 
 ```cpp
 #include <chrono>
-#include <stdexcept>
+#include <cstdint>
+
 #include "xenor/xenor.hpp"
 
-struct State final : xenor::SimulationState {
-  std::uint64_t counter{0};
-};
-
-struct TickInput {
-  std::uint64_t delta{0};
-};
-
-struct SnapshotPayload {
-  std::uint64_t counter{0};
-};
-
-struct SnapshotAdapter {
-  using payload_type = SnapshotPayload;
-
-  xenor::snapshot_boundary_payload_version_type payload_version() const { return 2; }
-
-  bool supports_payload_version(
-      xenor::snapshot_boundary_payload_version_type payload_version) const {
-    return payload_version == 1 || payload_version == 2;
-  }
-
-  payload_type capture(const State& state) { return SnapshotPayload{state.counter}; }
-
-  State restore(const payload_type& payload,
-                xenor::snapshot_boundary_payload_version_type payload_version) {
-    State state;
-    state.counter = payload.counter;
-
-    if (payload_version == 1 || payload_version == 2) {
-      return state;
-    }
-
-    throw std::invalid_argument("unsupported snapshot payload version");
-  }
+struct CounterState final : xenor::SimulationState {
+  std::uint64_t value{0};
 };
 
 int main() {
   using namespace std::chrono_literals;
 
-  xenor::SimulationEngine<State, TickInput> engine{xenor::SimulationConfig{1ms, 41}};
-  engine.enable_replay_capture();
-  engine.add_system(xenor::SystemPhase::PreUpdate,
-                    "apply_input",
-                    [](State& state, const xenor::InputStepContext<TickInput>& context) {
-    state.counter += context.input().delta;
-  });
-  engine.add_system("increment", [](State& state, const xenor::InputStepContext<TickInput>& context) {
-    state.counter += context.rng().next_u64() % 2ULL;
-  });
-  engine.add_system(xenor::SystemPhase::PostUpdate,
-                    "finalize",
-                    [](State& state, const xenor::InputStepContext<TickInput>&) {
-    state.counter += 1;
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 41}};
+  engine.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    ++state.value;
   });
 
-  const xenor::InputSequence<TickInput> inputs{{{1}, {2}, {3}}};
-  engine.run_for_sequence(inputs);
+  engine.run_for_ticks(4);
   const auto snapshot = engine.capture_snapshot();
-  SnapshotAdapter adapter;
-  const auto boundary = engine.capture_snapshot_boundary(adapter);
-  const auto engine_version = boundary.metadata.engine_version;
-  const auto payload_version = boundary.payload_version;
-  const auto event_count = engine.replay_trace().events.size();
 
-  engine.restore_snapshot(snapshot);
-  engine.restore_snapshot_boundary(boundary, adapter);
-  static_cast<void>(engine_version);
-  static_cast<void>(payload_version);
-  static_cast<void>(event_count);
+  return snapshot.state.value == 4 ? 0 : 1;
 }
 ```
+
+This is the smallest useful flow:
+
+- define a copyable state type derived from `SimulationState`
+- construct `SimulationEngine<State>` with an explicit fixed timestep and seed
+- register one or more systems
+- step or run the engine for a known number of ticks
+- capture a snapshot when you need an exact deterministic checkpoint
+
+Use `SimulationEngine<State, Input>` and `run_for_sequence()` when explicit per-tick inputs are part of the deterministic contract.
+
+## Snapshot Boundaries
+
+Snapshot boundaries exist to separate engine-owned deterministic metadata from user-owned state payload handling.
+
+- `SnapshotBoundaryMetadata` is engine-owned
+  It carries `engine_version`, tick, elapsed simulated time, seed, and authoritative state metadata such as `last_completed_tick`.
+- `SnapshotBoundary<Payload>` is user-owned at the payload layer
+  It carries the adapter-defined payload value and `payload_version`.
+- `SnapshotStateAdapter` is responsible for payload capture, payload restore, payload version support, and any payload migration behavior.
+
+The engine enforces:
+
+- engine-version compatibility
+- deterministic metadata and configuration compatibility
+- strict restore ordering
+- authoritative re-application of engine-owned metadata
+
+The engine does not:
+
+- serialize payloads
+- choose a persistence format
+- persist snapshots to disk
+- migrate payloads on behalf of user code
+- provide hidden compatibility fallbacks
+
+The public snapshot-boundary API lives in [`include/xenor/snapshot_boundary.hpp`](include/xenor/snapshot_boundary.hpp).
+
+## Core Design Goals
+
+- deterministic execution from identical initial state, configuration, seed, inputs, and system ordering
+- fixed-timestep progression in integer ticks
+- explicit state evolution and stable update ordering
+- replay-oriented inspection through in-memory traces
+- snapshot restore without hidden runtime state
+- explicit snapshot projection boundaries without engine-owned serialization
+- small public surface area and readable implementation
+
+## Current Status
+
+`xenor-engine` v0.1.0 is a narrow but usable foundation.
+
+Implemented today:
+
+- fixed-timestep engine core
+- explicit seed handling and per-tick input sequencing
+- fixed phase ordering
+- optional in-memory replay traces
+- snapshot capture and restore
+- version-aware snapshot boundaries
+- adapter-owned payload restore and migration
+- baseline tests, one example, one benchmark target, and CI
+
+## Out Of Scope
+
+The current repository does not provide:
+
+- file I/O persistence
+- built-in snapshot encoding formats
+- serializer infrastructure
+- engine-owned payload migration logic
+- rollback execution
+- parallel scheduling
+- broad game-framework features
+
+## Further Reading
+
+- [docs/architecture.md](docs/architecture.md)
+  Core types, update flow, snapshot-boundary structure, and ordering model.
+- [docs/determinism.md](docs/determinism.md)
+  Determinism guarantees, restore ordering, snapshot-boundary failure model, and adapter responsibilities.
+- [`include/xenor/snapshot_boundary.hpp`](include/xenor/snapshot_boundary.hpp)
+  Public boundary types, error codes, and adapter contract details.
+- [`examples/resource_pipeline_example.cpp`](examples/resource_pipeline_example.cpp)
+  The current end-to-end example for first-time users.
 
 ## Repository Layout
 
@@ -304,35 +187,19 @@ int main() {
 - `src/`
   non-template library implementation
 - `examples/`
-  runnable deterministic example workloads
+  runnable example workloads
 - `tests/`
   unit tests
 - `benchmarks/`
-  Google Benchmark targets
+  Google Benchmark target
 - `docs/`
   architecture and determinism notes
-- `cmake/`
-  project-local CMake modules
-- `.github/workflows/`
-  CI configuration
-
-## Roadmap
-
-- add more representative benchmark scenarios
-- add state inspection helpers for larger workloads
-- evaluate scheduling extensions without weakening ordering guarantees
 
 ## Development Notes
 
-- Prefer integer-based state and explicit ordering for simulation logic that must remain reproducible.
 - Keep seeds and per-tick inputs explicit at the engine boundary.
-- Use phases to separate preparation, state mutation, and derived-state work when that structure clarifies deterministic ordering.
-- Use the step-context random source instead of ambient global randomness when repeatability matters.
-- Keep snapshot payload conversion explicit in user code rather than hiding it behind engine-owned serialization.
-- Keep payload version support and migration decisions explicit in adapters rather than adding engine-owned fallback behavior.
-- Keep adapter payload-version reporting self-consistent: `payload_version()` should describe the payload emitted by `capture()`, and `supports_payload_version()` should return `true` for that version.
-- Do not treat `last_completed_tick` as adapter-owned state. The engine re-applies it authoritatively during restore.
+- Use fixed phases to make ordering visible instead of implicit.
+- Prefer the step-context RNG over ambient global randomness.
+- Keep snapshot payload conversion and payload migration in adapters.
+- Do not treat `last_completed_tick` as payload-owned state.
 - Use replay traces for inspection and regression validation, not as a persistence format.
-- Keep system callbacks small and explicit.
-- Treat benchmark results as workload-specific observations, not universal claims.
-- Avoid introducing dependencies that obscure state flow or execution order.
