@@ -125,17 +125,20 @@ Snapshot serialization boundaries are represented with three small pieces:
 
 `SnapshotBoundaryMetadata` carries the engine-owned deterministic metadata required to re-establish a compatible snapshot boundary:
 
+- boundary engine version
 - current tick
 - elapsed simulated time
 - configured seed
 - state last-completed-tick metadata
 
-`SnapshotBoundary<Payload>` combines that metadata with a user-defined payload value. The engine does not infer how arbitrary user state should become a payload. `SnapshotStateAdapter` makes that responsibility explicit through two operations:
+`SnapshotBoundary<Payload>` combines that metadata with a user-defined payload version and payload value. The engine does not infer how arbitrary user state should become a payload. `SnapshotStateAdapter` makes that responsibility explicit through four operations:
 
+- `payload_version() -> snapshot_boundary_payload_version_type`
+- `supports_payload_version(version) -> bool`
 - `capture(const State&) -> payload_type`
-- `restore(const payload_type&) -> State`
+- `restore(const payload_type&, version) -> State`
 
-The engine-level metadata remains separate from the payload so future persistence work can keep compatibility checks explicit without forcing a storage format into the core library.
+The engine-level metadata and engine-owned boundary version remain separate from the payload version so future persistence work can keep compatibility checks explicit without forcing a storage format into the core library.
 
 ## Update Flow
 
@@ -161,9 +164,9 @@ The step-local deterministic random source is shared across systems within the t
 
 When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems and their phase assignments are not modified, so continuation after restore uses the same update ordering as uninterrupted execution. The engine does not store a mutable RNG stream in the snapshot; continuing from a restored snapshot remains reproducible because each tick reconstructs its deterministic random source from the configured seed and tick number. If replay capture is enabled, restore also records a `SnapshotRestored` event.
 
-Snapshot boundary projection sits beside that restore path. `capture_snapshot_boundary()` first captures a normal `SimulationSnapshot<State>`, derives `SnapshotBoundaryMetadata` from it, and then delegates user-state payload extraction to the provided adapter. `restore_snapshot_boundary()` validates the boundary metadata against the engine configuration before reconstructing a `SimulationSnapshot<State>` through the adapter and restoring it through the normal snapshot path.
+Snapshot boundary projection sits beside that restore path. `capture_snapshot_boundary()` first captures a normal `SimulationSnapshot<State>`, derives `SnapshotBoundaryMetadata` from it, records the current engine-owned boundary version, and then delegates payload extraction and payload version selection to the provided adapter. `restore_snapshot_boundary()` validates the boundary metadata and engine version against the engine configuration before asking the adapter whether the payload version is supported. Only after those checks does it reconstruct a `SimulationSnapshot<State>` through the adapter and restore it through the normal snapshot path.
 
-The engine treats `SimulationState` metadata as engine-owned. Adapters are responsible for the user-defined state payload; the engine restores `last_completed_tick` from boundary metadata after adapter reconstruction so payload code does not need to duplicate engine metadata handling.
+The engine treats `SimulationState` metadata as engine-owned. Adapters are responsible for the user-defined state payload, payload version compatibility, and any payload migration behavior. The engine restores `last_completed_tick` from boundary metadata after adapter reconstruction so payload code does not need to duplicate engine metadata handling.
 
 ## Stable Ordering
 

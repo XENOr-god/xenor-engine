@@ -14,6 +14,7 @@ Within the current design, `xenor-engine` guarantees:
 - per-tick random state is derived deterministically from the configured seed and tick number
 - snapshots capture deterministic clock metadata, the configured seed, and state
 - snapshot boundaries expose deterministic snapshot metadata plus a user-defined payload projection path
+- snapshot boundaries carry an engine-owned boundary version and a user-owned payload version
 - replay traces record deterministic execution events when replay capture is enabled
 - restoring a captured snapshot re-establishes the captured tick, seed contract, and state
 - restoring through a snapshot boundary reuses the same restore compatibility checks as direct snapshot restore
@@ -112,6 +113,8 @@ The current implementation uses these checks to reject incompatible snapshots ra
 Snapshot serialization boundaries extend that model without changing it. The engine can project a valid in-memory snapshot into:
 
 - deterministic engine metadata in `SnapshotBoundaryMetadata`
+- an engine-owned boundary version in `SnapshotBoundaryMetadata::engine_version`
+- a user-owned payload version in `SnapshotBoundary<Payload>::payload_version`
 - a user-defined payload in `SnapshotBoundary<Payload>`
 
 This boundary is useful for:
@@ -121,6 +124,16 @@ This boundary is useful for:
 - testing payload projection and reconstruction paths independently from storage concerns
 
 The boundary does not serialize arbitrary state automatically. Deterministic behavior still depends on the adapter being deterministic and on the payload capturing all user-defined state required for restore. The engine validates boundary metadata, but it does not verify that an adapter payload is semantically complete beyond reconstructing a `State` value that satisfies the normal snapshot restore checks.
+
+Restore ordering is intentionally strict:
+
+1. the engine validates the boundary engine version
+2. the engine validates deterministic snapshot metadata against the configured engine
+3. the adapter explicitly confirms payload version support
+4. the adapter reconstructs state, including any explicit payload migration logic
+5. the engine re-applies engine-owned state metadata such as `last_completed_tick`
+
+The engine rejects incompatible engine versions directly. Payload version differences are only accepted when the adapter explicitly reports support and reconstructs the state accordingly. There is no engine-owned payload migration path and no silent compatibility fallback.
 
 Replay in the current repository means deterministic re-execution under identical initial state, configuration, seed, phase-ordered systems, and inputs, or deterministic continuation after restoring a snapshot and replaying the remaining input sequence. Replay traces provide an in-memory execution summary for that process, but there is no serialized replay log, event stream export, or file-based input capture yet.
 
