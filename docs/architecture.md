@@ -8,7 +8,7 @@
 
 ### `SimulationConfig`
 
-`SimulationConfig` defines the fixed tick duration for a simulation run. The current implementation validates this value at construction time and rejects zero or negative durations.
+`SimulationConfig` defines the fixed tick duration and base deterministic seed for a simulation run. The current implementation validates the tick duration at construction time and rejects zero or negative durations.
 
 ### `SimulationClock`
 
@@ -26,29 +26,43 @@ The clock advances only through explicit engine calls. It does not consult wall-
 
 The current design uses inheritance here deliberately and narrowly. It avoids deeper class hierarchies while still giving the engine a consistent state contract.
 
-State types used with `SimulationEngine<State>` must remain copyable because snapshots are captured and restored by value.
+State types used with `SimulationEngine<State, Input>` must remain copyable because snapshots are captured and restored by value.
 
-### `StepContext`
+### `DeterministicRng`
 
-`StepContext` is constructed for each executed tick and passed to each registered system. It currently contains:
+`DeterministicRng` is a small step-local random source. The engine constructs it from a per-tick seed derived from the configured base seed and the tick number. Systems that need pseudorandom behavior are expected to consume this source through the step context rather than use ambient global randomness.
+
+### `InputSequence<Input>`
+
+`InputSequence<Input>` is a lightweight ordered container for deterministic per-tick inputs. `run_for_sequence()` consumes entries in order, one input per executed tick. The type also exposes `slice()` so callers can resume from a known input offset after snapshot restore.
+
+### `InputStepContext<Input>` / `StepContext`
+
+`InputStepContext<Input>` is constructed for each executed tick and passed to each registered system. `StepContext` is the no-input alias used by `SimulationEngine<State, NoInput>`. The input-aware form currently contains:
 
 - tick number being executed
 - fixed tick duration
 - elapsed simulated time at the end of that tick
+- configured base seed
+- per-tick derived seed
+- access to the input value for that tick
+- access to the step-local deterministic random source
 
-### `SimulationEngine<State>`
+### `SimulationEngine<State, Input>`
 
-`SimulationEngine<State>` owns:
+`SimulationEngine<State, Input>` owns:
 
 - the validated simulation configuration
 - the simulation clock
 - the active simulation state value
 - the ordered list of registered systems
 
-The engine exposes two primary execution entry points:
+The engine exposes the following execution entry points:
 
-- `step()`
-- `run_for_ticks()`
+- `step()` for no-input engines
+- `step(const Input&)` for input-aware engines
+- `run_for_ticks()` for no-input engines
+- `run_for_sequence()` for input-aware engines
 
 It also exposes:
 
@@ -61,23 +75,28 @@ It also exposes:
 
 - current tick
 - elapsed simulated time
+- configured seed
 - a copy of the simulation state
 
-Snapshots can be restored back into a compatible engine instance. Compatibility is intentionally narrow: restore expects snapshot clock metadata to match the engine configuration and expects state tick metadata to match the captured tick.
+Snapshots can be restored back into a compatible engine instance. Compatibility is intentionally narrow: restore expects snapshot clock metadata and snapshot seed to match the engine configuration, and expects state tick metadata to match the captured tick.
 
 ## Update Flow
 
-For each call to `step()`:
+For each executed tick:
 
 1. The engine determines the next tick number.
-2. A `StepContext` is created for that tick.
-3. Systems execute in registration order.
-4. The clock advances.
-5. The state's completed-tick metadata is updated.
+2. The engine derives a per-tick seed from the configured base seed and tick number.
+3. A step-local deterministic random source is created from that per-tick seed.
+4. An `InputStepContext<Input>` or `StepContext` is created for that tick.
+5. Systems execute in registration order.
+6. The clock advances.
+7. The state's completed-tick metadata is updated.
 
 No dynamic scheduling occurs in the current implementation. Deterministic ordering depends on the registration sequence and on user code preserving deterministic behavior inside each callback.
 
-When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems are not modified, so continuation after restore uses the same update ordering as uninterrupted execution.
+The step-local deterministic random source is shared across systems within the tick. Because systems execute in stable registration order, random draws remain reproducible as long as system logic and input sequencing remain unchanged.
+
+When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems are not modified, so continuation after restore uses the same update ordering as uninterrupted execution. The engine does not store a mutable RNG stream in the snapshot; continuing from a restored snapshot remains reproducible because each tick reconstructs its deterministic random source from the configured seed and tick number.
 
 ## Stable Ordering
 
@@ -94,7 +113,7 @@ Those features can be valuable later, but they would complicate deterministic re
 
 ## Template Boundary
 
-`SimulationEngine<State>` is header-only because it is templated on the user state type. Non-template components such as the clock and configuration live in `src/` and compile into the core library target.
+`SimulationEngine<State, Input>` is header-only because it is templated on the user state type and optional input type. Non-template components such as the clock and configuration live in `src/` and compile into the core library target.
 
 This split keeps the public API generic without turning the entire repository into a header-only implementation.
 
@@ -118,6 +137,5 @@ Natural next steps include:
 
 - replay event capture
 - serialized snapshots
-- deterministic input stream handling
 - larger benchmark workloads
 - optional scheduling extensions with explicit ordering semantics
