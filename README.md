@@ -20,6 +20,7 @@ The current repository provides:
 - snapshot capture and restore
 - explicit snapshot serialization boundaries
 - explicit snapshot boundary version semantics
+- explicit snapshot boundary restore diagnostics
 - deterministic restore-and-continue validation
 - one runnable deterministic example
 - baseline unit tests
@@ -38,6 +39,7 @@ The current repository provides:
 - snapshot restore without hidden runtime state
 - explicit snapshot projection boundaries without engine-owned state serialization
 - explicit separation between engine-owned boundary versioning and user-owned payload versioning
+- explicit, distinguishable snapshot boundary restore failures
 - architecture that supports replay validation and future replay-oriented features
 - baseline benchmarking support
 - small dependency surface
@@ -79,8 +81,9 @@ The engine is organized around a small set of core types:
   owns the clock, the active state value, and the ordered system list
 - `SimulationSnapshot<State>`
   captures tick, elapsed simulated time, the configured seed, and a copy of the current state
-- `SnapshotBoundaryMetadata`, `SnapshotBoundary<Payload>`, `SnapshotStateAdapter`
-  define the engine metadata, engine-owned boundary version, payload version, and user-owned payload boundary for future snapshot persistence work
+- `SnapshotBoundaryMetadata`, `SnapshotBoundary<Payload>`, `SnapshotStateAdapter`,
+  `SnapshotBoundaryErrorCode`, `SnapshotBoundaryError`
+  define the engine metadata, engine-owned boundary version, payload version, adapter contract, and restore diagnostics for future snapshot persistence work
 
 Systems are registered explicitly and execute in registration order. The engine does not perform any dynamic scheduling or wall-clock based stepping.
 Systems execute in fixed phase order: `PreUpdate`, `Update`, then `PostUpdate`. Within a phase, execution order remains registration-based. Systems added through the existing `add_system(name, callback)` overload default to the `Update` phase.
@@ -113,6 +116,7 @@ The current implementation follows these rules:
 - snapshot boundary restore rejects incompatible engine boundary versions before payload restore occurs
 - restoring a captured snapshot restores the exact tick, elapsed time, configured seed, and state value
 - restoring through a snapshot boundary requires the same engine configuration and explicit adapter support for the captured payload version
+- snapshot boundary restore failures are reported with boundary-specific error codes
 - repeated runs with identical initial state, configuration, seed, inputs, phase registration, and system logic should produce identical results and identical replay traces
 
 This does not remove all sources of nondeterminism from user code. Callbacks can still introduce nondeterministic behavior if they read wall-clock time, use unstable containers for externally visible ordering, depend on nondeterministic external input, bypass the step-local deterministic random source, or rely on undefined behavior. Replay traces reflect those choices; they do not compensate for them.
@@ -131,6 +135,7 @@ What exists today:
 - snapshot capture and restore
 - snapshot boundary projection through `capture_snapshot_boundary()` and `restore_snapshot_boundary()`
 - explicit snapshot boundary version checks with adapter-owned payload compatibility decisions
+- boundary-specific restore diagnostics through `SnapshotBoundaryError`
 - tick-scoped deterministic random number generation through the step context
 - deterministic resource-pipeline example with phased execution, seed reuse, input sequencing, replay-trace summaries, snapshot-boundary inspection, version-aware restore, and restore-and-continue validation
 - unit tests for tick progression, phase ordering, seed handling, input sequencing, replay traces, snapshot capture and restore, snapshot-boundary version validation, and repeatability
@@ -190,6 +195,27 @@ Build and run the example:
 
 The example runs a deterministic four-stage resource pipeline, captures a mid-run snapshot, continues execution, restores the snapshot, and verifies that the replayed continuation matches the uninterrupted run.
 It uses explicit `PreUpdate`, `Update`, and `PostUpdate` phases, an explicit per-tick input sequence, a configured seed, and a tick-scoped deterministic random source. It enables replay capture, compares repeated traces for equality, projects a snapshot through an explicit boundary payload adapter, restores from the current payload version, and demonstrates an explicit adapter-owned legacy payload migration path.
+
+## Snapshot Boundary Failures
+
+Snapshot boundary restore now reports boundary-specific failures through `SnapshotBoundaryError` and `SnapshotBoundaryErrorCode`.
+
+Restore failures are separated into:
+
+- `IncompatibleEngineVersion`
+  The boundary was produced by a different engine-owned boundary contract. Recreate the boundary with a compatible engine version.
+- `InvalidStateMetadata`
+  Boundary state metadata is internally inconsistent, or the restored state does not match authoritative engine metadata. Verify the boundary metadata and do not let adapters own `last_completed_tick`.
+- `IncompatibleElapsedDuration`
+  Boundary time metadata does not match the restoring engine configuration. Restore with the same fixed-timestep configuration used to capture the boundary.
+- `IncompatibleSeed`
+  Boundary seed metadata does not match the restoring engine configuration. Restore with the matching deterministic seed.
+- `UnsupportedPayloadVersion`
+  The adapter does not accept the captured payload version. Use a matching adapter version or implement explicit migration in the adapter.
+- `AdapterContractViolation`
+  The adapter reports an inconsistent payload-version contract, such as declaring a payload version it does not support. Fix the adapter implementation.
+- `AdapterRestoreFailure`
+  The adapter accepted the payload version but failed while reconstructing state. Review payload completeness and version-specific restore logic.
 
 ## Minimal API Sketch
 
@@ -304,6 +330,8 @@ int main() {
 - Use the step-context random source instead of ambient global randomness when repeatability matters.
 - Keep snapshot payload conversion explicit in user code rather than hiding it behind engine-owned serialization.
 - Keep payload version support and migration decisions explicit in adapters rather than adding engine-owned fallback behavior.
+- Keep adapter payload-version reporting self-consistent: `payload_version()` should describe the payload emitted by `capture()`, and `supports_payload_version()` should return `true` for that version.
+- Do not treat `last_completed_tick` as adapter-owned state. The engine re-applies it authoritatively during restore.
 - Use replay traces for inspection and regression validation, not as a persistence format.
 - Keep system callbacks small and explicit.
 - Treat benchmark results as workload-specific observations, not universal claims.

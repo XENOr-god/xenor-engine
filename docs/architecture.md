@@ -115,13 +115,15 @@ It also exposes:
 
 Snapshots can be restored back into a compatible engine instance. Compatibility is intentionally narrow: restore expects snapshot clock metadata and snapshot seed to match the engine configuration, and expects state tick metadata to match the captured tick.
 
-### `SnapshotBoundaryMetadata`, `SnapshotBoundary<Payload>`, and `SnapshotStateAdapter`
+### `SnapshotBoundaryMetadata`, `SnapshotBoundary<Payload>`, `SnapshotStateAdapter`, `SnapshotBoundaryErrorCode`, and `SnapshotBoundaryError`
 
 Snapshot serialization boundaries are represented with three small pieces:
 
 - `SnapshotBoundaryMetadata`
 - `SnapshotBoundary<Payload>`
 - `SnapshotStateAdapter`
+- `SnapshotBoundaryErrorCode`
+- `SnapshotBoundaryError`
 
 `SnapshotBoundaryMetadata` carries the engine-owned deterministic metadata required to re-establish a compatible snapshot boundary:
 
@@ -139,6 +141,16 @@ Snapshot serialization boundaries are represented with three small pieces:
 - `restore(const payload_type&, version) -> State`
 
 The engine-level metadata and engine-owned boundary version remain separate from the payload version so future persistence work can keep compatibility checks explicit without forcing a storage format into the core library.
+
+`SnapshotBoundaryErrorCode` and `SnapshotBoundaryError` provide structured diagnostics for boundary creation and restore failures without introducing a larger error-handling framework. The current error codes are:
+
+- `IncompatibleEngineVersion`
+- `InvalidStateMetadata`
+- `IncompatibleElapsedDuration`
+- `IncompatibleSeed`
+- `UnsupportedPayloadVersion`
+- `AdapterContractViolation`
+- `AdapterRestoreFailure`
 
 ## Update Flow
 
@@ -167,6 +179,16 @@ When a snapshot is restored, the engine clock and active state are replaced dire
 Snapshot boundary projection sits beside that restore path. `capture_snapshot_boundary()` first captures a normal `SimulationSnapshot<State>`, derives `SnapshotBoundaryMetadata` from it, records the current engine-owned boundary version, and then delegates payload extraction and payload version selection to the provided adapter. `restore_snapshot_boundary()` validates the boundary metadata and engine version against the engine configuration before asking the adapter whether the payload version is supported. Only after those checks does it reconstruct a `SimulationSnapshot<State>` through the adapter and restore it through the normal snapshot path.
 
 The engine treats `SimulationState` metadata as engine-owned. Adapters are responsible for the user-defined state payload, payload version compatibility, and any payload migration behavior. The engine restores `last_completed_tick` from boundary metadata after adapter reconstruction so payload code does not need to duplicate engine metadata handling.
+
+Boundary restore failure categories are intentionally narrow:
+
+- engine version mismatch
+- deterministic metadata/config mismatch
+- unsupported payload version
+- adapter contract violation
+- adapter restore failure
+
+The engine does not attempt recovery. Restore either succeeds with validated metadata and authoritative engine state, or it fails before mutating engine state.
 
 ## Stable Ordering
 

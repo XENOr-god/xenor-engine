@@ -19,6 +19,7 @@ Within the current design, `xenor-engine` guarantees:
 - restoring a captured snapshot re-establishes the captured tick, seed contract, and state
 - restoring through a snapshot boundary reuses the same restore compatibility checks as direct snapshot restore
 - restore-and-continue execution uses the same registered system order as uninterrupted execution
+- snapshot boundary restore failures are ordered, explicit, and non-mutating
 - repeated runs with identical initial state, configuration, seed, system set, phase registration, and input sequence produce identical results and identical replay traces
 
 These guarantees are intentionally narrow. They define the engine contract, not the full behavior of arbitrary user code.
@@ -134,6 +135,31 @@ Restore ordering is intentionally strict:
 5. the engine re-applies engine-owned state metadata such as `last_completed_tick`
 
 The engine rejects incompatible engine versions directly. Payload version differences are only accepted when the adapter explicitly reports support and reconstructs the state accordingly. There is no engine-owned payload migration path and no silent compatibility fallback.
+
+The current boundary restore failure categories are:
+
+- `IncompatibleEngineVersion`
+- `InvalidStateMetadata`
+- `IncompatibleElapsedDuration`
+- `IncompatibleSeed`
+- `UnsupportedPayloadVersion`
+- `AdapterContractViolation`
+- `AdapterRestoreFailure`
+
+These categories are intended to separate engine-owned compatibility failures from adapter-owned payload failures.
+
+Recommended responses are:
+
+- for engine version or deterministic metadata mismatches, restore with the same engine configuration used to capture the boundary
+- for unsupported payload versions, use an adapter that explicitly supports that version or add explicit migration logic
+- for adapter contract violations, fix the adapter so `payload_version()`, `supports_payload_version()`, `capture()`, and `restore()` describe the same payload contract
+- for adapter restore failures, verify that the payload contains the state required by the adapter's selected version path
+
+Common adapter mistakes include:
+
+- returning a payload version from `payload_version()` that `supports_payload_version()` later rejects
+- treating `last_completed_tick` as payload-owned state instead of engine-owned metadata
+- accepting a payload version in `supports_payload_version()` and then failing to implement the corresponding restore path
 
 Replay in the current repository means deterministic re-execution under identical initial state, configuration, seed, phase-ordered systems, and inputs, or deterministic continuation after restoring a snapshot and replaying the remaining input sequence. Replay traces provide an in-memory execution summary for that process, but there is no serialized replay log, event stream export, or file-based input capture yet.
 
