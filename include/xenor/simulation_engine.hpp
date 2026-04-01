@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "xenor/input_sequence.hpp"
 #include "xenor/simulation_clock.hpp"
 #include "xenor/simulation_config.hpp"
 #include "xenor/simulation_snapshot.hpp"
@@ -21,14 +22,16 @@ namespace xenor {
 template <typename State>
 concept EngineState = std::derived_from<State, SimulationState> && std::copyable<State>;
 
-template <EngineState State>
+template <EngineState State, typename Input = NoInput>
 class SimulationEngine {
 public:
   using state_type = State;
+  using input_type = Input;
   using tick_type = SimulationClock::tick_type;
   using duration_type = SimulationConfig::duration_type;
   using seed_type = SimulationConfig::seed_type;
-  using system_type = std::function<void(State&, const StepContext&)>;
+  using step_context_type = InputStepContext<Input>;
+  using system_type = std::function<void(State&, const step_context_type&)>;
 
   static_assert(std::copyable<State>,
                 "SimulationEngine state must be copyable for snapshot capture and restore.");
@@ -70,35 +73,24 @@ public:
     return names;
   }
 
-  void step() {
-    const auto current_tick = clock_.current_tick();
-    if (current_tick == std::numeric_limits<tick_type>::max()) {
-      throw std::overflow_error("simulation tick overflow");
-    }
-
-    const auto next_tick = current_tick + 1;
-    const auto step_seed = derive_step_seed(config_.seed(), next_tick);
-    DeterministicRng step_rng{step_seed};
-    const StepContext context{
-        next_tick,
-        config_.tick_duration(),
-        clock_.elapsed_duration_at(next_tick),
-        config_.seed(),
-        step_seed,
-        &step_rng,
-    };
-
-    for (const auto& system : systems_) {
-      system.callback(state_, context);
-    }
-
-    clock_.advance();
-    state_.set_last_completed_tick(clock_.current_tick());
+  void step() requires std::same_as<Input, NoInput> {
+    step_impl(nullptr);
   }
 
-  void run_for_ticks(tick_type ticks) {
+  void step(const Input& input) requires (!std::same_as<Input, NoInput>) {
+    step_impl(&input);
+  }
+
+  void run_for_ticks(tick_type ticks) requires std::same_as<Input, NoInput> {
     for (tick_type tick = 0; tick < ticks; ++tick) {
       step();
+    }
+  }
+
+  void run_for_sequence(const InputSequence<Input>& inputs)
+      requires (!std::same_as<Input, NoInput>) {
+    for (const auto& input : inputs) {
+      step(input);
     }
   }
 
@@ -124,6 +116,33 @@ private:
     std::string name;
     system_type callback;
   };
+
+  void step_impl(const Input* input) {
+    const auto current_tick = clock_.current_tick();
+    if (current_tick == std::numeric_limits<tick_type>::max()) {
+      throw std::overflow_error("simulation tick overflow");
+    }
+
+    const auto next_tick = current_tick + 1;
+    const auto step_seed = derive_step_seed(config_.seed(), next_tick);
+    DeterministicRng step_rng{step_seed};
+    const step_context_type context{
+        next_tick,
+        config_.tick_duration(),
+        clock_.elapsed_duration_at(next_tick),
+        config_.seed(),
+        step_seed,
+        input,
+        &step_rng,
+    };
+
+    for (const auto& system : systems_) {
+      system.callback(state_, context);
+    }
+
+    clock_.advance();
+    state_.set_last_completed_tick(clock_.current_tick());
+  }
 
   [[nodiscard]] static seed_type derive_step_seed(seed_type seed, tick_type tick) noexcept {
     return DeterministicRng::mix(
