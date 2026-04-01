@@ -9,6 +9,8 @@ Within the current design, `xenor-engine` guarantees:
 - system execution order is stable and registration-based
 - engine time is derived from tick count rather than wall-clock time
 - snapshots capture deterministic clock metadata alongside state
+- restoring a captured snapshot re-establishes the captured tick and state
+- restore-and-continue execution uses the same registered system order as uninterrupted execution
 
 These guarantees are intentionally narrow. They define the engine contract, not the full behavior of arbitrary user code.
 
@@ -43,7 +45,18 @@ Snapshot support in the current repository is intentionally simple: a snapshot i
 This is sufficient to establish:
 
 - a concrete checkpoint boundary
+- exact restore to a previous deterministic state
 - a repeatability comparison mechanism in tests and examples
 - a clear path toward future replay support
+
+Restore semantics are intentionally strict:
+
+- the snapshot tick must be representable by the engine clock
+- the snapshot elapsed duration must match the elapsed duration implied by the engine's fixed tick duration and tick
+- the snapshot state's completed-tick metadata must match the snapshot tick
+
+The current implementation uses these checks to reject incompatible snapshots rather than attempt implicit correction.
+
+Replay in the current repository means deterministic re-execution under identical inputs or deterministic continuation after restoring a snapshot. There is no replay log, event stream, or serialized input capture yet.
 
 Replay logs, serialized state, and input capture are out of scope for the initial repository version.

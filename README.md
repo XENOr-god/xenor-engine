@@ -12,7 +12,8 @@ The current repository provides:
 - explicit fixed-timestep execution
 - stable system registration and update ordering
 - user-owned simulation state with deterministic tick metadata
-- snapshot-friendly state capture
+- snapshot capture and restore
+- deterministic restore-and-continue validation
 - one runnable deterministic example
 - baseline unit tests
 - one benchmark target for tick execution throughput
@@ -23,7 +24,8 @@ The current repository provides:
 - fixed-timestep progression in integer ticks
 - explicit state transitions
 - stable and inspectable update ordering
-- architecture that leaves room for replay and snapshot work
+- snapshot restore without hidden runtime state
+- architecture that supports replay validation and future replay-oriented features
 - baseline benchmarking support
 - small dependency surface
 
@@ -59,6 +61,8 @@ The engine is organized around a small set of core types:
 
 Systems are registered explicitly and execute in registration order. The engine does not perform any dynamic scheduling or wall-clock based stepping.
 
+State types used with `SimulationEngine<State>` must be copyable. Snapshot capture and restore operate on value copies of the active state.
+
 Additional design notes are documented in [docs/architecture.md](docs/architecture.md) and [docs/determinism.md](docs/determinism.md).
 
 ## Determinism Philosophy
@@ -72,6 +76,7 @@ The current implementation follows these rules:
 - the engine never reads wall-clock time
 - system execution order is stable and explicit
 - snapshots are copies of deterministic state plus clock metadata
+- restoring a captured snapshot restores the exact tick, elapsed time, and state value
 - repeated runs with identical initial state and identical system logic should produce identical results
 
 This does not remove all sources of nondeterminism from user code. Callbacks can still introduce nondeterministic behavior if they read wall-clock time, use unstable containers for externally visible ordering, depend on non-repeatable random input, or rely on undefined behavior. The engine is structured to make those hazards visible rather than hide them.
@@ -83,8 +88,9 @@ The repository is a first credible foundation, not a complete framework.
 What exists today:
 
 - core fixed-timestep engine library
-- deterministic resource-pipeline example
-- unit tests for tick progression, ordering, snapshots, and repeatability
+- snapshot capture and restore
+- deterministic resource-pipeline example with restore-and-continue validation
+- unit tests for tick progression, ordering, snapshot capture and restore, and repeatability
 - benchmark target for repeated tick execution
 - Linux CI for configure, build, and test
 
@@ -139,7 +145,7 @@ Build and run the example:
 ./build/examples/xenor_engine_resource_pipeline_example
 ```
 
-The example runs a deterministic four-stage resource pipeline and verifies that two identical runs produce the same final state before printing the snapshot summary.
+The example runs a deterministic four-stage resource pipeline, captures a mid-run snapshot, continues execution, restores the snapshot, and verifies that the replayed continuation matches the uninterrupted run.
 
 ## Minimal API Sketch
 
@@ -160,6 +166,10 @@ int main() {
   });
 
   engine.run_for_ticks(10);
+  const auto snapshot = engine.capture_snapshot();
+
+  engine.run_for_ticks(5);
+  engine.restore_snapshot(snapshot);
 }
 ```
 
