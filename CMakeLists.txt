@@ -56,6 +56,7 @@ target_sources(
       include/xenor/simulation_snapshot.hpp
       include/xenor/simulation_state.hpp
       include/xenor/step_context.hpp
+      include/xenor/system_phase.hpp
       include/xenor/xenor.hpp)
 
 install(

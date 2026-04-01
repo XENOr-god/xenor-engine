@@ -16,6 +16,7 @@
 #include "xenor/simulation_snapshot.hpp"
 #include "xenor/simulation_state.hpp"
 #include "xenor/step_context.hpp"
+#include "xenor/system_phase.hpp"
 
 namespace xenor {
 
@@ -30,6 +31,7 @@ public:
   using tick_type = SimulationClock::tick_type;
   using duration_type = SimulationConfig::duration_type;
   using seed_type = SimulationConfig::seed_type;
+  using phase_type = SystemPhase;
   using step_context_type = InputStepContext<Input>;
   using system_type = std::function<void(State&, const step_context_type&)>;
 
@@ -48,6 +50,10 @@ public:
   [[nodiscard]] seed_type seed() const noexcept { return config_.seed(); }
 
   std::size_t add_system(std::string name, system_type system) {
+    return add_system(phase_type::Update, std::move(name), std::move(system));
+  }
+
+  std::size_t add_system(phase_type phase, std::string name, system_type system) {
     if (name.empty()) {
       throw std::invalid_argument("system name must not be empty");
     }
@@ -56,7 +62,11 @@ public:
       throw std::invalid_argument("system callback must not be empty");
     }
 
-    systems_.push_back(RegisteredSystem{std::move(name), std::move(system)});
+    systems_.push_back(RegisteredSystem{
+        .phase = phase,
+        .name = std::move(name),
+        .callback = std::move(system),
+    });
     return systems_.size() - 1;
   }
 
@@ -113,6 +123,7 @@ public:
 
 private:
   struct RegisteredSystem {
+    phase_type phase{phase_type::Update};
     std::string name;
     system_type callback;
   };
@@ -136,8 +147,14 @@ private:
         &step_rng,
     };
 
-    for (const auto& system : systems_) {
-      system.callback(state_, context);
+    for (const auto phase : ordered_system_phases()) {
+      for (const auto& system : systems_) {
+        if (system.phase != phase) {
+          continue;
+        }
+
+        system.callback(state_, context);
+      }
     }
 
     clock_.advance();
