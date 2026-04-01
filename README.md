@@ -1,5 +1,9 @@
 # xenor-engine
 
+[![CI](https://github.com/XENOr-god/xenor-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/XENOr-god/xenor-engine/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Version: v0.1.0](https://img.shields.io/badge/version-v0.1.0-blue.svg)](https://github.com/XENOr-god/xenor-engine/releases/tag/v0.1.0)
+
 `xenor-engine` is a C++20 deterministic fixed-timestep simulation core for workloads that need repeatable state evolution, explicit tick progression, and replay-oriented validation.
 
 It is intentionally narrow. The repository provides a small engine substrate for simulation work where deterministic behavior matters more than feature breadth.
@@ -203,3 +207,7 @@ The current repository does not provide:
 - Keep snapshot payload conversion and payload migration in adapters.
 - Do not treat `last_completed_tick` as payload-owned state.
 - Use replay traces for inspection and regression validation, not as a persistence format.
+
+## License
+
+Released under the [MIT License](LICENSE).
