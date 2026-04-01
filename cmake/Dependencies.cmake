@@ -16,6 +16,8 @@ function(xenor_engine_require_catch2)
     GIT_SHALLOW TRUE)
 
   FetchContent_MakeAvailable(Catch2)
+  list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
+  set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH}" PARENT_SCOPE)
 endfunction()
 
 function(xenor_engine_require_benchmark)

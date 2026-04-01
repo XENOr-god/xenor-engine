@@ -31,7 +31,7 @@ public:
 
   explicit SimulationEngine(SimulationConfig config, State initial_state = {})
       : config_(std::move(config)), clock_(config_), state_(std::move(initial_state)) {
-    state_.last_completed_tick_ = clock_.current_tick();
+    state_.set_last_completed_tick(clock_.current_tick());
   }
 
   [[nodiscard]] const SimulationConfig& config() const noexcept { return config_; }
@@ -39,7 +39,7 @@ public:
   [[nodiscard]] const State& state() const noexcept { return state_; }
   [[nodiscard]] State& state() noexcept { return state_; }
 
-  [[nodiscard]] std::size_t add_system(std::string name, system_type system) {
+  std::size_t add_system(std::string name, system_type system) {
     if (name.empty()) {
       throw std::invalid_argument("system name must not be empty");
     }
@@ -83,7 +83,7 @@ public:
     }
 
     clock_.advance();
-    state_.last_completed_tick_ = clock_.current_tick();
+    state_.set_last_completed_tick(clock_.current_tick());
   }
 
   void run_for_ticks(tick_type ticks) {
