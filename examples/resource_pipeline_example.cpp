@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 
 #include "xenor/xenor.hpp"
 
@@ -49,6 +50,17 @@ bool identical(const xenor::SimulationSnapshot<ResourcePipelineState>& left,
 
 struct ResourcePipelineSnapshotAdapter {
   using payload_type = ResourcePipelinePayload;
+  static constexpr xenor::snapshot_boundary_payload_version_type
+      current_payload_version = 2;
+
+  xenor::snapshot_boundary_payload_version_type payload_version() const {
+    return current_payload_version;
+  }
+
+  bool supports_payload_version(
+      xenor::snapshot_boundary_payload_version_type payload_version) const {
+    return payload_version == 1 || payload_version == current_payload_version;
+  }
 
   payload_type capture(const ResourcePipelineState& state) {
     return payload_type{
@@ -60,14 +72,26 @@ struct ResourcePipelineSnapshotAdapter {
     };
   }
 
-  ResourcePipelineState restore(const payload_type& payload) {
+  ResourcePipelineState restore(
+      const payload_type& payload,
+      xenor::snapshot_boundary_payload_version_type payload_version) {
     ResourcePipelineState state;
     state.ore = payload.ore;
     state.ingots = payload.ingots;
     state.finished_units = payload.finished_units;
-    state.backlog = payload.backlog;
     state.random_checksum = payload.random_checksum;
-    return state;
+
+    if (payload_version == 1) {
+      state.backlog = 0;
+      return state;
+    }
+
+    if (payload_version == current_payload_version) {
+      state.backlog = payload.backlog;
+      return state;
+    }
+
+    throw std::invalid_argument("unsupported resource pipeline payload version");
   }
 };
 
@@ -149,6 +173,7 @@ int main() {
   auto restored = make_engine(seed);
   auto repeated = make_engine(seed);
   auto boundary_restored = make_engine(seed);
+  auto migrated_boundary_restored = make_engine(seed);
   ResourcePipelineSnapshotAdapter snapshot_adapter;
 
   uninterrupted.enable_replay_capture();
@@ -175,10 +200,17 @@ int main() {
   boundary_restored.restore_snapshot_boundary(serialized_boundary, snapshot_adapter);
   const auto boundary_restored_snapshot = boundary_restored.capture_snapshot();
 
+  auto legacy_boundary = serialized_boundary;
+  legacy_boundary.payload_version = 1;
+  legacy_boundary.state_payload.backlog = 0;
+  migrated_boundary_restored.restore_snapshot_boundary(legacy_boundary, snapshot_adapter);
+  const auto migrated_boundary_snapshot = migrated_boundary_restored.capture_snapshot();
+
   if (!identical(uninterrupted_final, repeated_final) ||
       !identical(first_continuation, replayed_continuation) ||
       !identical(uninterrupted_final, replayed_continuation) ||
       !identical(uninterrupted_final, boundary_restored_snapshot) ||
+      migrated_boundary_snapshot.state.backlog != 0 ||
       !(uninterrupted.replay_trace() == repeated.replay_trace()) ||
       count_events(restored.replay_trace(), xenor::ReplayEventKind::SnapshotRestored) != 1) {
     std::cerr << "deterministic input replay check failed\n";
@@ -200,11 +232,17 @@ int main() {
   std::cout << "finished_units: " << uninterrupted_final.state.finished_units << '\n';
   std::cout << "backlog: " << uninterrupted_final.state.backlog << '\n';
   std::cout << "random_checksum: " << uninterrupted_final.state.random_checksum << '\n';
+  std::cout << "boundary_engine_version: " << serialized_boundary.metadata.engine_version
+            << '\n';
+  std::cout << "boundary_payload_version: " << serialized_boundary.payload_version << '\n';
   std::cout << "boundary_tick: " << serialized_boundary.metadata.tick << '\n';
   std::cout << "boundary_state_last_completed_tick: "
             << serialized_boundary.metadata.state_last_completed_tick << '\n';
   std::cout << "boundary_payload_finished_units: "
             << serialized_boundary.state_payload.finished_units << '\n';
+  std::cout << "legacy_boundary_payload_version: " << legacy_boundary.payload_version << '\n';
+  std::cout << "legacy_boundary_backlog_after_restore: "
+            << migrated_boundary_snapshot.state.backlog << '\n';
   std::cout << "trace_events: " << uninterrupted.replay_trace().events.size() << '\n';
   std::cout << "trace_system_events: "
             << count_events(uninterrupted.replay_trace(), xenor::ReplayEventKind::SystemExecuted)
