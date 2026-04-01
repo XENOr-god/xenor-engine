@@ -55,6 +55,7 @@ target_sources(
       include/xenor/replay_trace.hpp
       include/xenor/simulation_engine.hpp
       include/xenor/simulation_snapshot.hpp
+      include/xenor/snapshot_boundary.hpp
       include/xenor/simulation_state.hpp
       include/xenor/step_context.hpp
       include/xenor/system_phase.hpp

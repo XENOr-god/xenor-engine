@@ -12,6 +12,7 @@
 
 #include "xenor/input_sequence.hpp"
 #include "xenor/replay_trace.hpp"
+#include "xenor/snapshot_boundary.hpp"
 #include "xenor/simulation_clock.hpp"
 #include "xenor/simulation_config.hpp"
 #include "xenor/simulation_snapshot.hpp"
@@ -134,12 +135,28 @@ public:
 
   [[nodiscard]] SimulationSnapshot<State> snapshot() const { return capture_snapshot(); }
 
+  template <typename Adapter>
+    requires SnapshotStateAdapter<Adapter, State>
+  [[nodiscard]] auto capture_snapshot_boundary(Adapter& adapter) const
+      -> SnapshotBoundary<typename Adapter::payload_type> {
+    return make_snapshot_boundary(capture_snapshot(), adapter);
+  }
+
   void restore_snapshot(const SimulationSnapshot<State>& snapshot) {
     validate_snapshot(snapshot);
     clock_.restore(snapshot.tick);
     state_ = snapshot.state;
     record_replay_event(replay_trace_type::event_type::snapshot_restored(
         snapshot.tick, snapshot.elapsed));
+  }
+
+  template <typename Payload, typename Adapter>
+    requires SnapshotStateAdapter<Adapter, State> &&
+             std::same_as<typename Adapter::payload_type, Payload>
+  void restore_snapshot_boundary(const SnapshotBoundary<Payload>& boundary,
+                                 Adapter& adapter) {
+    validate_snapshot_boundary_metadata(boundary.metadata, config_);
+    restore_snapshot(restore_snapshot_from_boundary<State>(boundary, adapter));
   }
 
 private:
