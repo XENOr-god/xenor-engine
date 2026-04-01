@@ -52,33 +52,48 @@ bool identical(const ResourcePipelineState& left, const ResourcePipelineState& r
          left.last_completed_tick() == right.last_completed_tick();
 }
 
+bool identical(const xenor::SimulationSnapshot<ResourcePipelineState>& left,
+               const xenor::SimulationSnapshot<ResourcePipelineState>& right) {
+  return left.tick == right.tick && left.elapsed == right.elapsed &&
+         identical(left.state, right.state);
+}
+
 }  // namespace
 
 int main() {
-  auto first_run = make_engine();
-  auto second_run = make_engine();
+  auto engine = make_engine();
 
-  constexpr std::uint64_t tick_count = 12;
-  first_run.run_for_ticks(tick_count);
-  second_run.run_for_ticks(tick_count);
+  constexpr std::uint64_t checkpoint_ticks = 8;
+  constexpr std::uint64_t continuation_ticks = 4;
 
-  const auto first_snapshot = first_run.snapshot();
-  const auto second_snapshot = second_run.snapshot();
+  engine.run_for_ticks(checkpoint_ticks);
+  const auto checkpoint = engine.capture_snapshot();
 
-  if (!identical(first_snapshot.state, second_snapshot.state)) {
+  engine.run_for_ticks(continuation_ticks);
+  const auto uninterrupted = engine.capture_snapshot();
+
+  engine.restore_snapshot(checkpoint);
+  engine.run_for_ticks(continuation_ticks);
+  const auto replayed = engine.capture_snapshot();
+
+  if (!identical(uninterrupted, replayed)) {
     std::cerr << "deterministic replay check failed\n";
     return EXIT_FAILURE;
   }
 
+  const auto checkpoint_elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(checkpoint.elapsed);
   const auto elapsed =
-      std::chrono::duration_cast<std::chrono::milliseconds>(first_snapshot.elapsed);
+      std::chrono::duration_cast<std::chrono::milliseconds>(uninterrupted.elapsed);
 
-  std::cout << "tick: " << first_snapshot.tick << '\n';
+  std::cout << "checkpoint_tick: " << checkpoint.tick << '\n';
+  std::cout << "checkpoint_elapsed_ms: " << checkpoint_elapsed.count() << '\n';
+  std::cout << "tick: " << uninterrupted.tick << '\n';
   std::cout << "elapsed_ms: " << elapsed.count() << '\n';
-  std::cout << "ore: " << first_snapshot.state.ore << '\n';
-  std::cout << "ingots: " << first_snapshot.state.ingots << '\n';
-  std::cout << "components: " << first_snapshot.state.components << '\n';
-  std::cout << "finished_units: " << first_snapshot.state.finished_units << '\n';
+  std::cout << "ore: " << uninterrupted.state.ore << '\n';
+  std::cout << "ingots: " << uninterrupted.state.ingots << '\n';
+  std::cout << "components: " << uninterrupted.state.components << '\n';
+  std::cout << "finished_units: " << uninterrupted.state.finished_units << '\n';
 
   return EXIT_SUCCESS;
 }
