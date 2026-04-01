@@ -13,9 +13,10 @@ Within the current design, `xenor-engine` guarantees:
 - engine time is derived from tick count rather than wall-clock time
 - per-tick random state is derived deterministically from the configured seed and tick number
 - snapshots capture deterministic clock metadata, the configured seed, and state
+- replay traces record deterministic execution events when replay capture is enabled
 - restoring a captured snapshot re-establishes the captured tick, seed contract, and state
 - restore-and-continue execution uses the same registered system order as uninterrupted execution
-- repeated runs with identical initial state, configuration, seed, system set, phase registration, and input sequence produce identical results
+- repeated runs with identical initial state, configuration, seed, system set, phase registration, and input sequence produce identical results and identical replay traces
 
 These guarantees are intentionally narrow. They define the engine contract, not the full behavior of arbitrary user code.
 
@@ -62,6 +63,30 @@ Because the step-local random source is recreated from the base seed and tick nu
 
 Phase assignments are part of the reproducibility contract. Changing a system from `PreUpdate` to `Update`, or changing registration order within a phase, changes deterministic behavior even when the state, seed, and inputs are unchanged.
 
+## Replay Event Capture
+
+Replay capture is intentionally small and in-memory.
+
+When enabled, the engine records deterministic execution markers for:
+
+- tick start
+- input applied
+- system executed
+- tick completion
+- snapshot restored
+
+This is useful for:
+
+- validating that repeated runs produce the same execution trace
+- making phase and system ordering visible in tests
+- inspecting restore boundaries without introducing a persistence format
+
+This is not yet:
+
+- a serialized replay log
+- a full event-sourcing model
+- a capture of arbitrary user-defined state mutations
+
 ## Snapshots and Replay
 
 Snapshot support in the current repository is intentionally simple: a snapshot is a copy of state plus clock position and configured seed.
@@ -82,6 +107,6 @@ Restore semantics are intentionally strict:
 
 The current implementation uses these checks to reject incompatible snapshots rather than attempt implicit correction.
 
-Replay in the current repository means deterministic re-execution under identical initial state, configuration, seed, phase-ordered systems, and inputs, or deterministic continuation after restoring a snapshot and replaying the remaining input sequence. There is no replay log, event stream, or serialized input capture yet.
+Replay in the current repository means deterministic re-execution under identical initial state, configuration, seed, phase-ordered systems, and inputs, or deterministic continuation after restoring a snapshot and replaying the remaining input sequence. Replay traces provide an in-memory execution summary for that process, but there is no serialized replay log, event stream export, or file-based input capture yet.
 
 Replay logs, serialized state, and input capture are out of scope for the initial repository version.

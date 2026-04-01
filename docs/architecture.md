@@ -46,6 +46,24 @@ The existing `add_system(name, callback)` overload registers systems into `Updat
 
 `InputSequence<Input>` is a lightweight ordered container for deterministic per-tick inputs. `run_for_sequence()` consumes entries in order, one input per executed tick. The type also exposes `slice()` so callers can resume from a known input offset after snapshot restore.
 
+### `ReplayEventKind`, `ReplayEvent<Input>`, and `ReplayTrace<Input>`
+
+Replay capture is modeled with three small types:
+
+- `ReplayEventKind`
+- `ReplayEvent<Input>`
+- `ReplayTrace<Input>`
+
+`ReplayTrace<Input>` is an in-memory ordered event sequence. The current event kinds are:
+
+- `TickStarted`
+- `InputApplied`
+- `SystemExecuted`
+- `TickCompleted`
+- `SnapshotRestored`
+
+The trace is intended for deterministic inspection and equality comparison in tests. It is not a serialization format and it does not attempt to capture arbitrary user-defined state changes.
+
 ### `InputStepContext<Input>` / `StepContext`
 
 `InputStepContext<Input>` is constructed for each executed tick and passed to each registered system. `StepContext` is the no-input alias used by `SimulationEngine<State, NoInput>`. The input-aware form currently contains:
@@ -78,6 +96,9 @@ It also exposes:
 
 - `add_system(name, callback)` for `Update`-phase registration
 - `add_system(SystemPhase, name, callback)` for explicit phase selection
+- `enable_replay_capture()` / `disable_replay_capture()`
+- `clear_replay_trace()`
+- `replay_trace()`
 - `capture_snapshot()`
 - `restore_snapshot()`
 
@@ -100,17 +121,21 @@ For each executed tick:
 2. The engine derives a per-tick seed from the configured base seed and tick number.
 3. A step-local deterministic random source is created from that per-tick seed.
 4. An `InputStepContext<Input>` or `StepContext` is created for that tick.
-5. `PreUpdate` systems execute in registration order.
-6. `Update` systems execute in registration order.
-7. `PostUpdate` systems execute in registration order.
-8. The clock advances.
-9. The state's completed-tick metadata is updated.
+5. If replay capture is enabled, a `TickStarted` event is recorded.
+6. If an input value is present and replay capture is enabled, an `InputApplied` event is recorded.
+7. `PreUpdate` systems execute in registration order.
+8. `Update` systems execute in registration order.
+9. `PostUpdate` systems execute in registration order.
+10. If replay capture is enabled, each system execution records a `SystemExecuted` event before the callback runs.
+11. The clock advances.
+12. The state's completed-tick metadata is updated.
+13. If replay capture is enabled, a `TickCompleted` event is recorded.
 
 No dynamic scheduling occurs in the current implementation. Deterministic ordering depends on the fixed phase order, the registration sequence within each phase, and user code preserving deterministic behavior inside each callback.
 
-The step-local deterministic random source is shared across systems within the tick. Because systems execute in stable registration order, random draws remain reproducible as long as system logic and input sequencing remain unchanged.
+The step-local deterministic random source is shared across systems within the tick. Because systems execute in stable registration order, random draws remain reproducible as long as system logic and input sequencing remain unchanged. Replay event order follows the same deterministic structure.
 
-When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems and their phase assignments are not modified, so continuation after restore uses the same update ordering as uninterrupted execution. The engine does not store a mutable RNG stream in the snapshot; continuing from a restored snapshot remains reproducible because each tick reconstructs its deterministic random source from the configured seed and tick number.
+When a snapshot is restored, the engine clock and active state are replaced directly from the captured values. Registered systems and their phase assignments are not modified, so continuation after restore uses the same update ordering as uninterrupted execution. The engine does not store a mutable RNG stream in the snapshot; continuing from a restored snapshot remains reproducible because each tick reconstructs its deterministic random source from the configured seed and tick number. If replay capture is enabled, restore also records a `SnapshotRestored` event.
 
 ## Stable Ordering
 
@@ -123,7 +148,7 @@ The repository does not currently attempt:
 - parallel execution
 - automatic rescheduling
 
-Those features can be valuable later, but they would complicate deterministic reasoning at this stage. The current model keeps ordering transparent: phase first, registration order second.
+Those features can be valuable later, but they would complicate deterministic reasoning at this stage. The current model keeps ordering transparent: phase first, registration order second, optional replay markers on top of that ordering.
 
 ## Template Boundary
 
@@ -149,7 +174,6 @@ The benchmark target exists to make changes measurable from the beginning.
 
 Natural next steps include:
 
-- replay event capture
 - serialized snapshots
 - larger benchmark workloads
 - optional scheduling extensions with explicit ordering semantics
