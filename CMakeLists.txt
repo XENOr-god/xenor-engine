@@ -65,3 +65,18 @@ install(
   EXPORT xenor-engine-targets
   NAMESPACE xenor::
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/xenor-engine)
+
+if(XENOR_ENGINE_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
+
+if(XENOR_ENGINE_BUILD_TESTS)
+  include(CTest)
+  if(BUILD_TESTING)
+    add_subdirectory(tests)
+  endif()
+endif()
+
+if(XENOR_ENGINE_BUILD_BENCHMARKS)
+  add_subdirectory(benchmarks)
+endif()
