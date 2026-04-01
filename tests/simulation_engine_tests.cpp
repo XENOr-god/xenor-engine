@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -232,6 +233,72 @@ struct MetadataOwnershipSnapshotAdapter {
   }
 };
 
+struct ThrowingRestoreSnapshotAdapter {
+  using payload_type = CounterPayload;
+  static constexpr xenor::snapshot_boundary_payload_version_type
+      current_payload_version = 1;
+
+  std::size_t supports_calls{0};
+  std::size_t restore_calls{0};
+
+  xenor::snapshot_boundary_payload_version_type payload_version() const {
+    return current_payload_version;
+  }
+
+  bool supports_payload_version(
+      xenor::snapshot_boundary_payload_version_type payload_version) {
+    ++supports_calls;
+    return payload_version == current_payload_version;
+  }
+
+  payload_type capture(const CounterState& state) {
+    return payload_type{
+        .value = state.value,
+        .execution_trace = state.execution_trace,
+    };
+  }
+
+  CounterState restore(const payload_type&,
+                       xenor::snapshot_boundary_payload_version_type payload_version) {
+    ++restore_calls;
+    if (payload_version != current_payload_version) {
+      throw std::invalid_argument("unexpected throwing restore payload version");
+    }
+
+    throw std::runtime_error("adapter restore rejected the payload");
+  }
+};
+
+struct InconsistentCaptureSnapshotAdapter {
+  using payload_type = CounterPayload;
+  static constexpr xenor::snapshot_boundary_payload_version_type
+      declared_payload_version = 7;
+
+  xenor::snapshot_boundary_payload_version_type payload_version() const {
+    return declared_payload_version;
+  }
+
+  bool supports_payload_version(
+      xenor::snapshot_boundary_payload_version_type) const {
+    return false;
+  }
+
+  payload_type capture(const CounterState& state) {
+    return payload_type{
+        .value = state.value,
+        .execution_trace = state.execution_trace,
+    };
+  }
+
+  CounterState restore(const payload_type& payload,
+                       xenor::snapshot_boundary_payload_version_type) {
+    CounterState state;
+    state.value = payload.value;
+    state.execution_trace = payload.execution_trace;
+    return state;
+  }
+};
+
 template <typename State>
 bool identical(const xenor::SimulationSnapshot<State>& left,
                const xenor::SimulationSnapshot<State>& right) {
@@ -335,6 +402,19 @@ std::size_t count_events(const xenor::ReplayTrace<Input>& trace,
       }));
 }
 
+template <typename Action>
+void require_snapshot_boundary_error(Action&& action,
+                                     xenor::SnapshotBoundaryErrorCode expected_code,
+                                     std::string_view expected_message_fragment) {
+  try {
+    action();
+    FAIL("expected SnapshotBoundaryError");
+  } catch (const xenor::SnapshotBoundaryError& error) {
+    REQUIRE(error.code() == expected_code);
+    REQUIRE(std::string{error.what()}.find(expected_message_fragment) != std::string::npos);
+  }
+}
+
 }  // namespace
 
 TEST_CASE("SimulationConfig stores an explicit deterministic seed", "[config][seed]") {
@@ -431,6 +511,8 @@ TEST_CASE("Snapshot boundary adapters are invoked for capture and restore",
 
   CounterSnapshotAdapter adapter;
   const auto boundary = source.capture_snapshot_boundary(adapter);
+  adapter.supports_calls = 0;
+  adapter.restore_calls = 0;
 
   xenor::SimulationEngine<CounterState> restored{xenor::SimulationConfig{1ms, 19}};
   restored.restore_snapshot_boundary(boundary, adapter);
@@ -442,48 +524,7 @@ TEST_CASE("Snapshot boundary adapters are invoked for capture and restore",
 }
 
 TEST_CASE("Malformed snapshot boundary metadata is rejected",
-          "[snapshot][boundary]") {
-  using namespace std::chrono_literals;
-
-  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 19}};
-  engine.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
-    state.value += 1;
-  });
-
-  engine.run_for_ticks(2);
-
-  CounterSnapshotAdapter adapter;
-  auto boundary = engine.capture_snapshot_boundary(adapter);
-  boundary.metadata.state_last_completed_tick = boundary.metadata.tick + 1;
-
-  REQUIRE_THROWS_AS(
-      xenor::restore_snapshot_from_boundary<CounterState>(boundary, adapter),
-      std::invalid_argument);
-}
-
-TEST_CASE("Snapshot boundary restore rejects incompatible engine metadata",
-          "[snapshot][boundary]") {
-  using namespace std::chrono_literals;
-
-  xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
-  source.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
-    state.value += 1;
-  });
-
-  source.run_for_ticks(2);
-
-  CounterSnapshotAdapter adapter;
-  const auto boundary = source.capture_snapshot_boundary(adapter);
-
-  xenor::SimulationEngine<CounterState> incompatible{xenor::SimulationConfig{2ms, 19}};
-  REQUIRE_THROWS_AS(incompatible.restore_snapshot_boundary(boundary, adapter),
-                    std::invalid_argument);
-  REQUIRE(adapter.supports_calls == 0);
-  REQUIRE(adapter.restore_calls == 0);
-}
-
-TEST_CASE("Snapshot boundary restore rejects incompatible engine version before payload checks",
-          "[snapshot][boundary][version]") {
+          "[snapshot][boundary][diagnostics]") {
   using namespace std::chrono_literals;
 
   xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
@@ -495,14 +536,105 @@ TEST_CASE("Snapshot boundary restore rejects incompatible engine version before 
 
   CounterSnapshotAdapter adapter;
   auto boundary = source.capture_snapshot_boundary(adapter);
+  adapter.supports_calls = 0;
+  adapter.restore_calls = 0;
+  boundary.metadata.state_last_completed_tick = boundary.metadata.tick + 1;
+
+  xenor::SimulationEngine<CounterState> restored{xenor::SimulationConfig{1ms, 19}};
+  const auto baseline = restored.capture_snapshot();
+
+  require_snapshot_boundary_error(
+      [&] { restored.restore_snapshot_boundary(boundary, adapter); },
+      xenor::SnapshotBoundaryErrorCode::InvalidStateMetadata,
+      "state_last_completed_tick");
+  REQUIRE(adapter.supports_calls == 0);
+  REQUIRE(adapter.restore_calls == 0);
+  REQUIRE(identical(restored.capture_snapshot(), baseline));
+}
+
+TEST_CASE("Snapshot boundary restore rejects incompatible engine metadata",
+          "[snapshot][boundary][diagnostics]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
+  source.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    state.value += 1;
+  });
+
+  source.run_for_ticks(2);
+
+  CounterSnapshotAdapter adapter;
+  const auto boundary = source.capture_snapshot_boundary(adapter);
+  adapter.supports_calls = 0;
+  adapter.restore_calls = 0;
+
+  xenor::SimulationEngine<CounterState> incompatible{xenor::SimulationConfig{2ms, 19}};
+  const auto baseline = incompatible.capture_snapshot();
+  require_snapshot_boundary_error(
+      [&] { incompatible.restore_snapshot_boundary(boundary, adapter); },
+      xenor::SnapshotBoundaryErrorCode::IncompatibleElapsedDuration,
+      "elapsed duration");
+  REQUIRE(adapter.supports_calls == 0);
+  REQUIRE(adapter.restore_calls == 0);
+  REQUIRE(identical(incompatible.capture_snapshot(), baseline));
+}
+
+TEST_CASE("Snapshot boundary restore rejects incompatible seeds",
+          "[snapshot][boundary][diagnostics]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
+  source.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    state.value += 1;
+  });
+
+  source.run_for_ticks(2);
+
+  CounterSnapshotAdapter adapter;
+  auto boundary = source.capture_snapshot_boundary(adapter);
+  adapter.supports_calls = 0;
+  adapter.restore_calls = 0;
+  boundary.metadata.seed = 23;
+
+  xenor::SimulationEngine<CounterState> restored{xenor::SimulationConfig{1ms, 19}};
+  const auto baseline = restored.capture_snapshot();
+
+  require_snapshot_boundary_error(
+      [&] { restored.restore_snapshot_boundary(boundary, adapter); },
+      xenor::SnapshotBoundaryErrorCode::IncompatibleSeed,
+      "does not match the engine configuration seed");
+  REQUIRE(adapter.supports_calls == 0);
+  REQUIRE(adapter.restore_calls == 0);
+  REQUIRE(identical(restored.capture_snapshot(), baseline));
+}
+
+TEST_CASE("Snapshot boundary restore rejects incompatible engine version before payload checks",
+          "[snapshot][boundary][diagnostics]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
+  source.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    state.value += 1;
+  });
+
+  source.run_for_ticks(2);
+
+  CounterSnapshotAdapter adapter;
+  auto boundary = source.capture_snapshot_boundary(adapter);
+  adapter.supports_calls = 0;
+  adapter.restore_calls = 0;
   boundary.metadata.engine_version += 1;
   boundary.payload_version += 1;
 
   xenor::SimulationEngine<CounterState> restored{xenor::SimulationConfig{1ms, 19}};
-  REQUIRE_THROWS_AS(restored.restore_snapshot_boundary(boundary, adapter),
-                    std::invalid_argument);
+  const auto baseline = restored.capture_snapshot();
+  require_snapshot_boundary_error(
+      [&] { restored.restore_snapshot_boundary(boundary, adapter); },
+      xenor::SnapshotBoundaryErrorCode::IncompatibleEngineVersion,
+      "expected");
   REQUIRE(adapter.supports_calls == 0);
   REQUIRE(adapter.restore_calls == 0);
+  REQUIRE(identical(restored.capture_snapshot(), baseline));
 }
 
 TEST_CASE("Snapshot boundary restore supports explicit payload migration",
@@ -540,7 +672,7 @@ TEST_CASE("Snapshot boundary restore supports explicit payload migration",
 }
 
 TEST_CASE("Snapshot boundary restore rejects unsupported payload versions",
-          "[snapshot][boundary][version]") {
+          "[snapshot][boundary][diagnostics]") {
   using namespace std::chrono_literals;
 
   xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
@@ -552,13 +684,19 @@ TEST_CASE("Snapshot boundary restore rejects unsupported payload versions",
 
   CounterSnapshotAdapter adapter;
   auto boundary = source.capture_snapshot_boundary(adapter);
+  adapter.supports_calls = 0;
+  adapter.restore_calls = 0;
   boundary.payload_version += 1;
 
   xenor::SimulationEngine<CounterState> restored{xenor::SimulationConfig{1ms, 19}};
-  REQUIRE_THROWS_AS(restored.restore_snapshot_boundary(boundary, adapter),
-                    std::invalid_argument);
+  const auto baseline = restored.capture_snapshot();
+  require_snapshot_boundary_error(
+      [&] { restored.restore_snapshot_boundary(boundary, adapter); },
+      xenor::SnapshotBoundaryErrorCode::UnsupportedPayloadVersion,
+      "is not supported");
   REQUIRE(adapter.supports_calls == 1);
   REQUIRE(adapter.restore_calls == 0);
+  REQUIRE(identical(restored.capture_snapshot(), baseline));
 }
 
 TEST_CASE("Snapshot boundary round-trip preserves continuation behavior",
@@ -599,6 +737,54 @@ TEST_CASE("Snapshot boundary projection does not change engine behavior",
   const auto after = engine.capture_snapshot();
 
   REQUIRE(identical(before, after));
+}
+
+TEST_CASE("Snapshot boundary capture rejects inconsistent adapter version contracts",
+          "[snapshot][boundary][diagnostics]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 19}};
+  engine.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    state.value += 1;
+  });
+
+  engine.run_for_ticks(2);
+  const auto baseline = engine.capture_snapshot();
+
+  InconsistentCaptureSnapshotAdapter adapter;
+  require_snapshot_boundary_error(
+      [&] { static_cast<void>(engine.capture_snapshot_boundary(adapter)); },
+      xenor::SnapshotBoundaryErrorCode::AdapterContractViolation,
+      "does not report support");
+  REQUIRE(identical(engine.capture_snapshot(), baseline));
+}
+
+TEST_CASE("Snapshot boundary restore surfaces adapter failures without mutating engine state",
+          "[snapshot][boundary][diagnostics]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
+  source.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    state.value += 1;
+  });
+
+  source.run_for_ticks(2);
+
+  ThrowingRestoreSnapshotAdapter adapter;
+  const auto boundary = source.capture_snapshot_boundary(adapter);
+  adapter.supports_calls = 0;
+  adapter.restore_calls = 0;
+
+  xenor::SimulationEngine<CounterState> restored{xenor::SimulationConfig{1ms, 19}};
+  const auto baseline = restored.capture_snapshot();
+
+  require_snapshot_boundary_error(
+      [&] { restored.restore_snapshot_boundary(boundary, adapter); },
+      xenor::SnapshotBoundaryErrorCode::AdapterRestoreFailure,
+      "adapter restore rejected the payload");
+  REQUIRE(adapter.supports_calls == 1);
+  REQUIRE(adapter.restore_calls == 1);
+  REQUIRE(identical(restored.capture_snapshot(), baseline));
 }
 
 TEST_CASE("Snapshot boundary restore preserves engine-owned state metadata",
