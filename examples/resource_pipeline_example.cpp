@@ -23,6 +23,16 @@ struct ResourcePipelineState final : xenor::SimulationState {
   std::uint64_t random_checksum{0};
 };
 
+struct ResourcePipelinePayload {
+  std::uint64_t ore{0};
+  std::uint64_t ingots{0};
+  std::uint64_t finished_units{0};
+  std::uint64_t backlog{0};
+  std::uint64_t random_checksum{0};
+
+  bool operator==(const ResourcePipelinePayload&) const = default;
+};
+
 bool identical(const ResourcePipelineState& left, const ResourcePipelineState& right) {
   return left.ore == right.ore && left.ingots == right.ingots &&
          left.finished_units == right.finished_units &&
@@ -36,6 +46,30 @@ bool identical(const xenor::SimulationSnapshot<ResourcePipelineState>& left,
   return left.tick == right.tick && left.elapsed == right.elapsed &&
          left.seed == right.seed && identical(left.state, right.state);
 }
+
+struct ResourcePipelineSnapshotAdapter {
+  using payload_type = ResourcePipelinePayload;
+
+  payload_type capture(const ResourcePipelineState& state) {
+    return payload_type{
+        .ore = state.ore,
+        .ingots = state.ingots,
+        .finished_units = state.finished_units,
+        .backlog = state.backlog,
+        .random_checksum = state.random_checksum,
+    };
+  }
+
+  ResourcePipelineState restore(const payload_type& payload) {
+    ResourcePipelineState state;
+    state.ore = payload.ore;
+    state.ingots = payload.ingots;
+    state.finished_units = payload.finished_units;
+    state.backlog = payload.backlog;
+    state.random_checksum = payload.random_checksum;
+    return state;
+  }
+};
 
 auto make_inputs() {
   return xenor::InputSequence<ResourceTickInput>{
@@ -114,6 +148,8 @@ int main() {
   auto uninterrupted = make_engine(seed);
   auto restored = make_engine(seed);
   auto repeated = make_engine(seed);
+  auto boundary_restored = make_engine(seed);
+  ResourcePipelineSnapshotAdapter snapshot_adapter;
 
   uninterrupted.enable_replay_capture();
   restored.enable_replay_capture();
@@ -135,9 +171,14 @@ int main() {
   repeated.run_for_sequence(inputs);
   const auto repeated_final = repeated.capture_snapshot();
 
+  const auto serialized_boundary = uninterrupted.capture_snapshot_boundary(snapshot_adapter);
+  boundary_restored.restore_snapshot_boundary(serialized_boundary, snapshot_adapter);
+  const auto boundary_restored_snapshot = boundary_restored.capture_snapshot();
+
   if (!identical(uninterrupted_final, repeated_final) ||
       !identical(first_continuation, replayed_continuation) ||
       !identical(uninterrupted_final, replayed_continuation) ||
+      !identical(uninterrupted_final, boundary_restored_snapshot) ||
       !(uninterrupted.replay_trace() == repeated.replay_trace()) ||
       count_events(restored.replay_trace(), xenor::ReplayEventKind::SnapshotRestored) != 1) {
     std::cerr << "deterministic input replay check failed\n";
@@ -159,6 +200,11 @@ int main() {
   std::cout << "finished_units: " << uninterrupted_final.state.finished_units << '\n';
   std::cout << "backlog: " << uninterrupted_final.state.backlog << '\n';
   std::cout << "random_checksum: " << uninterrupted_final.state.random_checksum << '\n';
+  std::cout << "boundary_tick: " << serialized_boundary.metadata.tick << '\n';
+  std::cout << "boundary_state_last_completed_tick: "
+            << serialized_boundary.metadata.state_last_completed_tick << '\n';
+  std::cout << "boundary_payload_finished_units: "
+            << serialized_boundary.state_payload.finished_units << '\n';
   std::cout << "trace_events: " << uninterrupted.replay_trace().events.size() << '\n';
   std::cout << "trace_system_events: "
             << count_events(uninterrupted.replay_trace(), xenor::ReplayEventKind::SystemExecuted)

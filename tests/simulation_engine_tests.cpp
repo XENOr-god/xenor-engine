@@ -22,6 +22,21 @@ struct PipelineState final : xenor::SimulationState {
   std::uint64_t finished_units{0};
 };
 
+struct CounterPayload {
+  std::int64_t value{0};
+  std::vector<std::string> execution_trace;
+
+  bool operator==(const CounterPayload&) const = default;
+};
+
+struct PipelinePayload {
+  std::uint64_t ore{0};
+  std::uint64_t ingots{0};
+  std::uint64_t finished_units{0};
+
+  bool operator==(const PipelinePayload&) const = default;
+};
+
 struct WorkloadInput {
   std::int64_t supply{0};
   std::int64_t demand{0};
@@ -57,6 +72,50 @@ bool identical(const SeededInputState& left, const SeededInputState& right) {
          left.input_trace == right.input_trace &&
          left.last_completed_tick() == right.last_completed_tick();
 }
+
+struct CounterSnapshotAdapter {
+  using payload_type = CounterPayload;
+
+  std::size_t capture_calls{0};
+  std::size_t restore_calls{0};
+
+  payload_type capture(const CounterState& state) {
+    ++capture_calls;
+    return payload_type{
+        .value = state.value,
+        .execution_trace = state.execution_trace,
+    };
+  }
+
+  CounterState restore(const payload_type& payload) {
+    ++restore_calls;
+
+    CounterState state;
+    state.value = payload.value;
+    state.execution_trace = payload.execution_trace;
+    return state;
+  }
+};
+
+struct PipelineSnapshotAdapter {
+  using payload_type = PipelinePayload;
+
+  payload_type capture(const PipelineState& state) {
+    return payload_type{
+        .ore = state.ore,
+        .ingots = state.ingots,
+        .finished_units = state.finished_units,
+    };
+  }
+
+  PipelineState restore(const payload_type& payload) {
+    PipelineState state;
+    state.ore = payload.ore;
+    state.ingots = payload.ingots;
+    state.finished_units = payload.finished_units;
+    return state;
+  }
+};
 
 template <typename State>
 bool identical(const xenor::SimulationSnapshot<State>& left,
@@ -214,6 +273,132 @@ TEST_CASE("SimulationEngine advances tick metadata and captures seed-aware snaps
   REQUIRE(snapshot.state.value == 6);
   REQUIRE(snapshot.state.last_completed_tick() == 3);
   REQUIRE(identical(snapshot, compatibility_snapshot));
+}
+
+TEST_CASE("Snapshot boundary metadata matches the in-memory snapshot",
+          "[snapshot][boundary]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 19}};
+  engine.add_system("increment", [](CounterState& state, const xenor::StepContext& context) {
+    state.value += static_cast<std::int64_t>(context.tick);
+  });
+
+  engine.run_for_ticks(3);
+
+  CounterSnapshotAdapter adapter;
+  const auto snapshot = engine.capture_snapshot();
+  const auto metadata = xenor::make_snapshot_boundary_metadata(snapshot);
+  const auto boundary = engine.capture_snapshot_boundary(adapter);
+
+  REQUIRE(metadata == boundary.metadata);
+  REQUIRE(boundary.metadata.tick == snapshot.tick);
+  REQUIRE(boundary.metadata.elapsed == snapshot.elapsed);
+  REQUIRE(boundary.metadata.seed == snapshot.seed);
+  REQUIRE(boundary.metadata.state_last_completed_tick ==
+          snapshot.state.last_completed_tick());
+  REQUIRE(adapter.capture_calls == 1);
+}
+
+TEST_CASE("Snapshot boundary adapters are invoked for capture and restore",
+          "[snapshot][boundary]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
+  source.add_system("increment", [](CounterState& state, const xenor::StepContext& context) {
+    state.value += static_cast<std::int64_t>(context.tick);
+  });
+
+  source.run_for_ticks(3);
+
+  CounterSnapshotAdapter adapter;
+  const auto boundary = source.capture_snapshot_boundary(adapter);
+
+  xenor::SimulationEngine<CounterState> restored{xenor::SimulationConfig{1ms, 19}};
+  restored.restore_snapshot_boundary(boundary, adapter);
+
+  REQUIRE(adapter.capture_calls == 1);
+  REQUIRE(adapter.restore_calls == 1);
+  REQUIRE(identical(source.capture_snapshot(), restored.capture_snapshot()));
+}
+
+TEST_CASE("Malformed snapshot boundary metadata is rejected",
+          "[snapshot][boundary]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 19}};
+  engine.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    state.value += 1;
+  });
+
+  engine.run_for_ticks(2);
+
+  CounterSnapshotAdapter adapter;
+  auto boundary = engine.capture_snapshot_boundary(adapter);
+  boundary.metadata.state_last_completed_tick = boundary.metadata.tick + 1;
+
+  REQUIRE_THROWS_AS(
+      xenor::restore_snapshot_from_boundary<CounterState>(boundary, adapter),
+      std::invalid_argument);
+}
+
+TEST_CASE("Snapshot boundary restore rejects incompatible engine metadata",
+          "[snapshot][boundary]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> source{xenor::SimulationConfig{1ms, 19}};
+  source.add_system("increment", [](CounterState& state, const xenor::StepContext&) {
+    state.value += 1;
+  });
+
+  source.run_for_ticks(2);
+
+  CounterSnapshotAdapter adapter;
+  const auto boundary = source.capture_snapshot_boundary(adapter);
+
+  xenor::SimulationEngine<CounterState> incompatible{xenor::SimulationConfig{2ms, 19}};
+  REQUIRE_THROWS_AS(incompatible.restore_snapshot_boundary(boundary, adapter),
+                    std::invalid_argument);
+}
+
+TEST_CASE("Snapshot boundary round-trip preserves continuation behavior",
+          "[snapshot][boundary][replay]") {
+  auto source = make_pipeline_engine();
+  auto restored = make_pipeline_engine();
+  auto uninterrupted = make_pipeline_engine();
+
+  source.run_for_ticks(6);
+
+  PipelineSnapshotAdapter adapter;
+  const auto boundary = source.capture_snapshot_boundary(adapter);
+
+  restored.restore_snapshot_boundary(boundary, adapter);
+
+  source.run_for_ticks(4);
+  restored.run_for_ticks(4);
+  uninterrupted.run_for_ticks(10);
+
+  REQUIRE(identical(source.capture_snapshot(), restored.capture_snapshot()));
+  REQUIRE(identical(uninterrupted.capture_snapshot(), restored.capture_snapshot()));
+}
+
+TEST_CASE("Snapshot boundary projection does not change engine behavior",
+          "[snapshot][boundary]") {
+  using namespace std::chrono_literals;
+
+  xenor::SimulationEngine<CounterState> engine{xenor::SimulationConfig{1ms, 19}};
+  engine.add_system("increment", [](CounterState& state, const xenor::StepContext& context) {
+    state.value += static_cast<std::int64_t>(context.tick);
+  });
+
+  engine.run_for_ticks(3);
+
+  CounterSnapshotAdapter adapter;
+  const auto before = engine.capture_snapshot();
+  static_cast<void>(engine.capture_snapshot_boundary(adapter));
+  const auto after = engine.capture_snapshot();
+
+  REQUIRE(identical(before, after));
 }
 
 TEST_CASE("System execution order remains stable", "[engine]") {
