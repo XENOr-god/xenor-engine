@@ -1,0 +1,15 @@
+build/
+build-*/
+out/
+.cache/
+compile_commands.json
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Tooling output
+Testing/
+_deps/
