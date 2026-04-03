@@ -1,0 +1,9 @@
+[package]
+name = "xenor-engine-rust"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "xenor_engine_rust"
+path = "src/lib.rs"

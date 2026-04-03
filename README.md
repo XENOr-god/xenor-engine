@@ -179,6 +179,8 @@ The current repository does not provide:
   Core types, update flow, snapshot-boundary structure, and ordering model.
 - [docs/determinism.md](docs/determinism.md)
   Determinism guarantees, restore ordering, snapshot-boundary failure model, and adapter responsibilities.
+- [docs/rust_architecture.md](docs/rust_architecture.md)
+  Determinism-first Rust-oriented engine architecture, subsystem boundaries, replay model, and roadmap toward native and web bindings.
 - [`include/xenor/snapshot_boundary.hpp`](include/xenor/snapshot_boundary.hpp)
   Public boundary types, error codes, and adapter contract details.
 - [`examples/resource_pipeline_example.cpp`](examples/resource_pipeline_example.cpp)
@@ -198,15 +200,21 @@ The current repository does not provide:
   Google Benchmark target
 - `docs/`
   architecture and determinism notes
+- `rust/`
+  Rust-oriented deterministic core workspace with grouped phase scheduling,
+  explicit snapshot cadence policy, append-only replay traces, and divergence
+  checking for future native/web binding integration
 
 ## Development Notes
 
 - Keep seeds and per-tick inputs explicit at the engine boundary.
 - Use fixed phases to make ordering visible instead of implicit.
 - Prefer the step-context RNG over ambient global randomness.
+- Keep scheduler group order explicit: `PreInput -> Input -> Simulation -> PostSimulation -> Finalize`.
+- Capture snapshots only through an explicit cadence policy; do not make them implicit side effects.
 - Keep snapshot payload conversion and payload migration in adapters.
 - Do not treat `last_completed_tick` as payload-owned state.
-- Use replay traces for inspection and regression validation, not as a persistence format.
+- Use append-only replay traces and divergence checks for inspection and regression validation, not as a persistence format.
 
 ## License
 
