@@ -4,8 +4,9 @@ use crate::canonical::{
     CANONICAL_TEXT_ENCODING, CanonicalLineReader, CanonicalLineWriter, decode_hex,
     decode_hex_string, encode_hex,
 };
+use crate::config::{ConfigArtifact, ConfigArtifactSerializer, SimulationConfig};
 use crate::core::{EngineError, Seed, Tick};
-use crate::engine::{ReplayableEngine, SnapshotPolicy};
+use crate::engine::ReplayableEngine;
 use crate::input::{Command, InputFrame};
 use crate::parity::{ParityArtifactSummary, ParityComparison, compare_parity_summaries};
 use crate::persistence::{
@@ -13,10 +14,11 @@ use crate::persistence::{
     SnapshotArtifactSerializer, record_replay,
 };
 use crate::replay::compare_replay_traces_with_snapshot_digest;
+use crate::scenario::{SimulationScenario, SimulationScenarioSerializer};
 use crate::serialization::Serializer;
 use crate::state::SimulationState;
 
-pub const GOLDEN_FIXTURE_SCHEMA_VERSION: u32 = 1;
+pub const GOLDEN_FIXTURE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GoldenFixtureMetadata {
@@ -29,12 +31,15 @@ pub struct GoldenFixtureSummary {
     pub base_seed: Seed,
     pub final_tick: Tick,
     pub final_checksum: u64,
+    pub config_payload_schema_version: u32,
+    pub config_digest: u64,
     pub replay_artifact_schema_version: u32,
     pub snapshot_artifact_schema_version: u32,
     pub command_payload_schema_version: u32,
     pub snapshot_payload_schema_version: u32,
     pub replay_digest: u64,
     pub snapshot_digest: Option<u64>,
+    pub scenario_digest: Option<u64>,
 }
 
 impl From<&ArtifactSummary> for GoldenFixtureSummary {
@@ -44,12 +49,15 @@ impl From<&ArtifactSummary> for GoldenFixtureSummary {
             base_seed: value.base_seed,
             final_tick: value.final_tick,
             final_checksum: value.final_checksum,
+            config_payload_schema_version: value.config_payload_schema_version,
+            config_digest: value.config_digest,
             replay_artifact_schema_version: value.replay_artifact_schema_version,
             snapshot_artifact_schema_version: value.snapshot_artifact_schema_version,
             command_payload_schema_version: value.command_payload_schema_version,
             snapshot_payload_schema_version: value.snapshot_payload_schema_version,
             replay_digest: value.replay_digest,
             snapshot_digest: value.snapshot_digest,
+            scenario_digest: value.scenario_digest,
         }
     }
 }
@@ -61,23 +69,29 @@ impl From<&GoldenFixtureSummary> for ParityArtifactSummary {
             base_seed: value.base_seed,
             final_tick: value.final_tick,
             final_checksum: value.final_checksum,
+            config_payload_schema_version: value.config_payload_schema_version,
+            config_digest: value.config_digest,
             replay_artifact_schema_version: value.replay_artifact_schema_version,
             snapshot_artifact_schema_version: value.snapshot_artifact_schema_version,
             command_payload_schema_version: value.command_payload_schema_version,
             snapshot_payload_schema_version: value.snapshot_payload_schema_version,
             replay_digest: value.replay_digest,
             snapshot_digest: value.snapshot_digest,
+            scenario_digest: value.scenario_digest,
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GoldenFixture<C, Snapshot>
+pub struct GoldenFixture<C, Snapshot, Config>
 where
     C: Command,
     Snapshot: Clone + Eq + fmt::Debug,
+    Config: Clone + Eq + fmt::Debug,
 {
     pub metadata: GoldenFixtureMetadata,
+    pub config_artifact: ConfigArtifact<Config>,
+    pub scenario_artifact: Option<SimulationScenario<C, Config>>,
     pub replay_artifact: ReplayArtifact<C, Snapshot>,
     pub snapshot_artifact: Option<SnapshotArtifact<Snapshot>>,
     pub summary: GoldenFixtureSummary,
@@ -88,37 +102,59 @@ pub struct GoldenFixtureResult {
     pub fixture_summary: GoldenFixtureSummary,
     pub actual_summary: ParityArtifactSummary,
     pub comparison: ParityComparison,
+    pub config_mismatch: Option<String>,
     pub replay_mismatch: Option<String>,
     pub snapshot_mismatch: Option<String>,
 }
 
 impl GoldenFixtureResult {
     pub fn passed(&self) -> bool {
-        self.comparison.is_match()
+        self.config_mismatch.is_none()
             && self.replay_mismatch.is_none()
             && self.snapshot_mismatch.is_none()
+            && self.comparison.is_match()
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct GoldenFixtureSerializer<C, Snapshot, CommandSerializer, SnapshotSerializer>
-where
+pub struct GoldenFixtureSerializer<
+    C,
+    Snapshot,
+    Config,
+    CommandSerializer,
+    SnapshotSerializer,
+    ConfigSerializer,
+> where
     C: Command,
     Snapshot: Clone + Eq + fmt::Debug,
+    Config: Clone + Eq + fmt::Debug,
 {
     replay_serializer: ReplayArtifactSerializer<C, Snapshot, CommandSerializer, SnapshotSerializer>,
     snapshot_serializer: SnapshotArtifactSerializer<Snapshot, SnapshotSerializer>,
+    config_artifact_serializer: ConfigArtifactSerializer<Config, ConfigSerializer>,
+    scenario_serializer:
+        SimulationScenarioSerializer<C, Config, CommandSerializer, ConfigSerializer>,
 }
 
-impl<C, Snapshot, CommandSerializer, SnapshotSerializer>
-    GoldenFixtureSerializer<C, Snapshot, CommandSerializer, SnapshotSerializer>
+impl<C, Snapshot, Config, CommandSerializer, SnapshotSerializer, ConfigSerializer>
+    GoldenFixtureSerializer<
+        C,
+        Snapshot,
+        Config,
+        CommandSerializer,
+        SnapshotSerializer,
+        ConfigSerializer,
+    >
 where
     C: Command,
     Snapshot: Clone + Eq + fmt::Debug,
+    Config: Clone + Eq + fmt::Debug + SimulationConfig,
     CommandSerializer: Serializer<C>,
     SnapshotSerializer: Serializer<Snapshot>,
+    ConfigSerializer: Serializer<Config>,
     CommandSerializer::Error: fmt::Display,
     SnapshotSerializer::Error: fmt::Display,
+    ConfigSerializer::Error: fmt::Display,
 {
     pub fn new(
         replay_serializer: ReplayArtifactSerializer<
@@ -128,25 +164,47 @@ where
             SnapshotSerializer,
         >,
         snapshot_serializer: SnapshotArtifactSerializer<Snapshot, SnapshotSerializer>,
+        config_artifact_serializer: ConfigArtifactSerializer<Config, ConfigSerializer>,
+        scenario_serializer: SimulationScenarioSerializer<
+            C,
+            Config,
+            CommandSerializer,
+            ConfigSerializer,
+        >,
     ) -> Self {
         Self {
             replay_serializer,
             snapshot_serializer,
+            config_artifact_serializer,
+            scenario_serializer,
         }
     }
 
     pub fn build_fixture(
         &self,
+        config_artifact: ConfigArtifact<Config>,
+        scenario_artifact: Option<SimulationScenario<C, Config>>,
         replay_artifact: ReplayArtifact<C, Snapshot>,
         snapshot_artifact: Option<SnapshotArtifact<Snapshot>>,
-    ) -> Result<GoldenFixture<C, Snapshot>, EngineError> {
-        let summary =
-            self.fixture_summary_from_artifacts(&replay_artifact, snapshot_artifact.as_ref())?;
+    ) -> Result<GoldenFixture<C, Snapshot, Config>, EngineError> {
+        validate_fixture_contract(
+            &config_artifact,
+            scenario_artifact.as_ref(),
+            &replay_artifact,
+            snapshot_artifact.as_ref(),
+        )?;
+        let summary = self.fixture_summary_from_artifacts(
+            &replay_artifact,
+            snapshot_artifact.as_ref(),
+            scenario_artifact.as_ref(),
+        )?;
 
         Ok(GoldenFixture {
             metadata: GoldenFixtureMetadata {
                 artifact_schema_version: GOLDEN_FIXTURE_SCHEMA_VERSION,
             },
+            config_artifact,
+            scenario_artifact,
             replay_artifact,
             snapshot_artifact,
             summary,
@@ -156,27 +214,59 @@ where
     pub fn generate_fixture<S, E, Build>(
         &self,
         base_seed: Seed,
-        snapshot_policy: SnapshotPolicy,
+        config_artifact: ConfigArtifact<Config>,
         frames: &[InputFrame<C>],
         build: Build,
-    ) -> Result<GoldenFixture<C, Snapshot>, EngineError>
+    ) -> Result<GoldenFixture<C, Snapshot, Config>, EngineError>
     where
         S: SimulationState<Snapshot = Snapshot>,
         E: ReplayableEngine<C, State = S>,
-        Build: Fn(Seed, SnapshotPolicy) -> E,
+        Build: Fn(Seed, &Config) -> E,
     {
+        let config = config_artifact.payload.clone();
         let recorded = record_replay::<C, S, E, _, _, _>(
             base_seed,
-            snapshot_policy,
+            config.snapshot_policy(),
+            config_artifact.metadata.identity,
             frames,
-            build,
+            move |seed, _snapshot_policy| build(seed, &config),
             &self.replay_serializer,
         )?;
 
-        self.build_fixture(recorded.artifact, recorded.result.final_snapshot)
+        self.build_fixture(
+            config_artifact,
+            None,
+            recorded.artifact,
+            recorded.result.final_snapshot,
+        )
     }
 
-    pub fn encode(&self, fixture: &GoldenFixture<C, Snapshot>) -> Result<Vec<u8>, EngineError> {
+    pub fn generate_fixture_from_scenario<S, E, Build>(
+        &self,
+        scenario: &SimulationScenario<C, Config>,
+        build: Build,
+    ) -> Result<GoldenFixture<C, Snapshot, Config>, EngineError>
+    where
+        S: SimulationState<Snapshot = Snapshot>,
+        E: ReplayableEngine<C, State = S>,
+        Build: Fn(Seed, &Config) -> E,
+    {
+        let execution = self
+            .scenario_serializer
+            .execute::<S, E, Build, SnapshotSerializer>(scenario, build, &self.replay_serializer)?;
+
+        self.build_fixture(
+            scenario.config_artifact.clone(),
+            Some(scenario.clone()),
+            execution.replay.artifact,
+            execution.final_snapshot,
+        )
+    }
+
+    pub fn encode(
+        &self,
+        fixture: &GoldenFixture<C, Snapshot, Config>,
+    ) -> Result<Vec<u8>, EngineError> {
         if fixture.metadata.artifact_schema_version != GOLDEN_FIXTURE_SCHEMA_VERSION {
             return Err(EngineError::UnsupportedSchemaVersion {
                 artifact: "golden fixture",
@@ -185,6 +275,14 @@ where
             });
         }
 
+        let config_bytes = self
+            .config_artifact_serializer
+            .encode(&fixture.config_artifact)?;
+        let scenario_bytes = fixture
+            .scenario_artifact
+            .as_ref()
+            .map(|artifact| self.scenario_serializer.encode(artifact))
+            .transpose()?;
         let replay_bytes = self.replay_serializer.encode(&fixture.replay_artifact)?;
         let snapshot_bytes = fixture
             .snapshot_artifact
@@ -199,33 +297,14 @@ where
             "artifact_schema_version",
             fixture.metadata.artifact_schema_version,
         );
-        writer.push_str_hex("summary.engine_family_hex", &fixture.summary.engine_family);
-        writer.push_display("summary.base_seed", fixture.summary.base_seed);
-        writer.push_display("summary.final_tick", fixture.summary.final_tick);
-        writer.push_display("summary.final_checksum", fixture.summary.final_checksum);
+        encode_fixture_summary(&mut writer, &fixture.summary);
+        writer.push_display("config_artifact_hex", encode_hex(&config_bytes));
         writer.push_display(
-            "summary.replay_artifact_schema_version",
-            fixture.summary.replay_artifact_schema_version,
+            "scenario_artifact.present",
+            encode_bool(scenario_bytes.is_some()),
         );
-        writer.push_display(
-            "summary.snapshot_artifact_schema_version",
-            fixture.summary.snapshot_artifact_schema_version,
-        );
-        writer.push_display(
-            "summary.command_payload_schema_version",
-            fixture.summary.command_payload_schema_version,
-        );
-        writer.push_display(
-            "summary.snapshot_payload_schema_version",
-            fixture.summary.snapshot_payload_schema_version,
-        );
-        writer.push_display("summary.replay_digest", fixture.summary.replay_digest);
-        writer.push_display(
-            "summary.snapshot_digest.present",
-            encode_bool(fixture.summary.snapshot_digest.is_some()),
-        );
-        if let Some(snapshot_digest) = fixture.summary.snapshot_digest {
-            writer.push_display("summary.snapshot_digest", snapshot_digest);
+        if let Some(bytes) = scenario_bytes {
+            writer.push_display("scenario_artifact_hex", encode_hex(&bytes));
         }
         writer.push_display("replay_artifact_hex", encode_hex(&replay_bytes));
         writer.push_display(
@@ -239,13 +318,9 @@ where
         Ok(writer.finish())
     }
 
-    pub fn decode(&self, bytes: &[u8]) -> Result<GoldenFixture<C, Snapshot>, EngineError> {
-        let mut reader = CanonicalLineReader::new(bytes, "golden fixture").map_err(|error| {
-            EngineError::CorruptedArtifact {
-                artifact: "golden fixture",
-                detail: error.to_string(),
-            }
-        })?;
+    pub fn decode(&self, bytes: &[u8]) -> Result<GoldenFixture<C, Snapshot, Config>, EngineError> {
+        let mut reader =
+            CanonicalLineReader::new(bytes, "golden fixture").map_err(golden_fixture_corrupted)?;
         expect_fixture_value(&mut reader, "artifact", "golden_fixture")?;
         expect_fixture_value(&mut reader, "canonical_encoding", CANONICAL_TEXT_ENCODING)?;
 
@@ -259,46 +334,26 @@ where
             });
         }
 
-        let summary = GoldenFixtureSummary {
-            engine_family: decode_hex_string(
-                read_fixture_value(&mut reader, "summary.engine_family_hex")?,
-                "golden fixture summary engine family",
-            )
-            .map_err(golden_fixture_corrupted)?,
-            base_seed: parse_u64(read_fixture_value(&mut reader, "summary.base_seed")?)?,
-            final_tick: parse_u64(read_fixture_value(&mut reader, "summary.final_tick")?)?,
-            final_checksum: parse_u64(read_fixture_value(&mut reader, "summary.final_checksum")?)?,
-            replay_artifact_schema_version: parse_u32(read_fixture_value(
-                &mut reader,
-                "summary.replay_artifact_schema_version",
-            )?)?,
-            snapshot_artifact_schema_version: parse_u32(read_fixture_value(
-                &mut reader,
-                "summary.snapshot_artifact_schema_version",
-            )?)?,
-            command_payload_schema_version: parse_u32(read_fixture_value(
-                &mut reader,
-                "summary.command_payload_schema_version",
-            )?)?,
-            snapshot_payload_schema_version: parse_u32(read_fixture_value(
-                &mut reader,
-                "summary.snapshot_payload_schema_version",
-            )?)?,
-            replay_digest: parse_u64(read_fixture_value(&mut reader, "summary.replay_digest")?)?,
-            snapshot_digest: {
-                let present = parse_bool(read_fixture_value(
-                    &mut reader,
-                    "summary.snapshot_digest.present",
-                )?)?;
-                if present {
-                    Some(parse_u64(read_fixture_value(
-                        &mut reader,
-                        "summary.snapshot_digest",
-                    )?)?)
-                } else {
-                    None
-                }
-            },
+        let summary = decode_fixture_summary(&mut reader)?;
+        let config_artifact_hex = read_fixture_value(&mut reader, "config_artifact_hex")?;
+        let config_artifact_bytes =
+            decode_hex(config_artifact_hex, "golden fixture config artifact")
+                .map_err(golden_fixture_corrupted)?;
+        let config_artifact = self
+            .config_artifact_serializer
+            .decode(&config_artifact_bytes)?;
+
+        let scenario_artifact = if parse_bool(read_fixture_value(
+            &mut reader,
+            "scenario_artifact.present",
+        )?)? {
+            let scenario_artifact_hex = read_fixture_value(&mut reader, "scenario_artifact_hex")?;
+            let scenario_artifact_bytes =
+                decode_hex(scenario_artifact_hex, "golden fixture scenario artifact")
+                    .map_err(golden_fixture_corrupted)?;
+            Some(self.scenario_serializer.decode(&scenario_artifact_bytes)?)
+        } else {
+            None
         };
 
         let replay_artifact_hex = read_fixture_value(&mut reader, "replay_artifact_hex")?;
@@ -327,6 +382,8 @@ where
             metadata: GoldenFixtureMetadata {
                 artifact_schema_version,
             },
+            config_artifact,
+            scenario_artifact,
             replay_artifact,
             snapshot_artifact,
             summary,
@@ -335,28 +392,50 @@ where
 
     pub fn verify_fixture<S, E, Build>(
         &self,
-        fixture: &GoldenFixture<C, Snapshot>,
+        fixture: &GoldenFixture<C, Snapshot, Config>,
         build: Build,
     ) -> Result<GoldenFixtureResult, EngineError>
     where
         S: SimulationState<Snapshot = Snapshot>,
         E: ReplayableEngine<C, State = S>,
-        Build: Fn(Seed, SnapshotPolicy) -> E,
+        Build: Fn(Seed, &Config) -> E,
     {
-        let frames = fixture
-            .replay_artifact
-            .records
-            .iter()
-            .map(|record| record.input.clone())
-            .collect::<Vec<_>>();
+        let (effective_config, base_seed, frames, scenario_digest) =
+            match &fixture.scenario_artifact {
+                Some(scenario) => (
+                    scenario.config_artifact.clone(),
+                    scenario.base_seed,
+                    scenario.frames.clone(),
+                    Some(self.scenario_serializer.digest(scenario)?),
+                ),
+                None => (
+                    fixture.config_artifact.clone(),
+                    fixture.replay_artifact.metadata.base_seed,
+                    fixture
+                        .replay_artifact
+                        .records
+                        .iter()
+                        .map(|record| record.input.clone())
+                        .collect(),
+                    None,
+                ),
+            };
+
+        let config_mismatch =
+            compare_fixture_config_contract(fixture, &effective_config, scenario_digest)?;
+
+        let config = effective_config.payload.clone();
         let recorded = record_replay::<C, S, E, _, _, _>(
-            fixture.replay_artifact.metadata.base_seed,
-            fixture.replay_artifact.metadata.snapshot_policy,
+            base_seed,
+            config.snapshot_policy(),
+            effective_config.metadata.identity,
             frames.as_slice(),
-            build,
+            move |seed, _snapshot_policy| build(seed, &config),
             &self.replay_serializer,
         )?;
-        let actual_summary = ParityArtifactSummary::from(&recorded.result.summary);
+
+        let mut actual_summary = ParityArtifactSummary::from(&recorded.result.summary);
+        actual_summary.scenario_digest = scenario_digest;
         let comparison = compare_parity_summaries(
             &ParityArtifactSummary::from(&fixture.summary),
             &actual_summary,
@@ -378,6 +457,7 @@ where
             fixture_summary: fixture.summary.clone(),
             actual_summary,
             comparison,
+            config_mismatch,
             replay_mismatch,
             snapshot_mismatch,
         })
@@ -387,16 +467,152 @@ where
         &self,
         replay_artifact: &ReplayArtifact<C, Snapshot>,
         snapshot_artifact: Option<&SnapshotArtifact<Snapshot>>,
+        scenario_artifact: Option<&SimulationScenario<C, Config>>,
     ) -> Result<GoldenFixtureSummary, EngineError> {
-        let replay_summary = self.replay_serializer.summary(replay_artifact)?;
-        let mut summary = GoldenFixtureSummary::from(&replay_summary);
-
+        let mut summary =
+            GoldenFixtureSummary::from(&self.replay_serializer.summary(replay_artifact)?);
         if let Some(snapshot_artifact) = snapshot_artifact {
             summary.snapshot_digest = Some(self.snapshot_serializer.digest(snapshot_artifact)?);
         }
-
+        if let Some(scenario_artifact) = scenario_artifact {
+            summary.scenario_digest = Some(self.scenario_serializer.digest(scenario_artifact)?);
+        }
         Ok(summary)
     }
+}
+
+fn validate_fixture_contract<C, Snapshot, Config>(
+    config_artifact: &ConfigArtifact<Config>,
+    scenario_artifact: Option<&SimulationScenario<C, Config>>,
+    replay_artifact: &ReplayArtifact<C, Snapshot>,
+    snapshot_artifact: Option<&SnapshotArtifact<Snapshot>>,
+) -> Result<(), EngineError>
+where
+    C: Command,
+    Snapshot: Clone + Eq + fmt::Debug,
+    Config: Clone + Eq + fmt::Debug + SimulationConfig,
+{
+    if replay_artifact.metadata.config_identity != config_artifact.metadata.identity {
+        return Err(EngineError::ConfigMismatch {
+            detail: format!(
+                "fixture replay config identity mismatch: expected {:?}, got {:?}",
+                config_artifact.metadata.identity, replay_artifact.metadata.config_identity
+            ),
+        });
+    }
+
+    if replay_artifact.metadata.snapshot_policy != config_artifact.payload.snapshot_policy() {
+        return Err(EngineError::ConfigMismatch {
+            detail: format!(
+                "fixture replay snapshot policy mismatch: expected {:?}, got {:?}",
+                config_artifact.payload.snapshot_policy(),
+                replay_artifact.metadata.snapshot_policy
+            ),
+        });
+    }
+
+    if let Some(snapshot_artifact) = snapshot_artifact {
+        if snapshot_artifact.metadata.base_seed != replay_artifact.metadata.base_seed {
+            return Err(EngineError::SnapshotMetadataMismatch {
+                detail: format!(
+                    "fixture snapshot base seed mismatch: expected {}, got {}",
+                    replay_artifact.metadata.base_seed, snapshot_artifact.metadata.base_seed
+                ),
+            });
+        }
+
+        if snapshot_artifact.metadata.config_identity != config_artifact.metadata.identity {
+            return Err(EngineError::ConfigMismatch {
+                detail: format!(
+                    "fixture snapshot config identity mismatch: expected {:?}, got {:?}",
+                    config_artifact.metadata.identity, snapshot_artifact.metadata.config_identity
+                ),
+            });
+        }
+    }
+
+    if let Some(scenario_artifact) = scenario_artifact {
+        if scenario_artifact.config_artifact != *config_artifact {
+            return Err(EngineError::ConfigMismatch {
+                detail: format!(
+                    "fixture config artifact does not match scenario config artifact: expected {:?}, got {:?}",
+                    scenario_artifact.config_artifact, config_artifact
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn compare_fixture_config_contract<C, Snapshot, Config>(
+    fixture: &GoldenFixture<C, Snapshot, Config>,
+    effective_config: &ConfigArtifact<Config>,
+    scenario_digest: Option<u64>,
+) -> Result<Option<String>, EngineError>
+where
+    C: Command,
+    Snapshot: Clone + Eq + fmt::Debug,
+    Config: Clone + Eq + fmt::Debug + SimulationConfig,
+{
+    if fixture.config_artifact.metadata.identity != effective_config.metadata.identity {
+        return Ok(Some(format!(
+            "fixture config identity mismatch: fixture {:?}, effective {:?}",
+            fixture.config_artifact.metadata.identity, effective_config.metadata.identity
+        )));
+    }
+
+    if fixture.replay_artifact.metadata.config_identity != effective_config.metadata.identity {
+        return Ok(Some(format!(
+            "replay config identity mismatch: expected {:?}, got {:?}",
+            effective_config.metadata.identity, fixture.replay_artifact.metadata.config_identity
+        )));
+    }
+
+    if fixture.replay_artifact.metadata.snapshot_policy
+        != effective_config.payload.snapshot_policy()
+    {
+        return Ok(Some(format!(
+            "replay snapshot policy mismatch: expected {:?}, got {:?}",
+            effective_config.payload.snapshot_policy(),
+            fixture.replay_artifact.metadata.snapshot_policy
+        )));
+    }
+
+    if fixture.summary.config_payload_schema_version
+        != effective_config.metadata.identity.payload_schema_version
+    {
+        return Ok(Some(format!(
+            "fixture summary config schema mismatch: expected {}, got {}",
+            effective_config.metadata.identity.payload_schema_version,
+            fixture.summary.config_payload_schema_version
+        )));
+    }
+
+    if fixture.summary.config_digest != effective_config.metadata.identity.digest {
+        return Ok(Some(format!(
+            "fixture summary config digest mismatch: expected {}, got {}",
+            effective_config.metadata.identity.digest, fixture.summary.config_digest
+        )));
+    }
+
+    if fixture.summary.scenario_digest != scenario_digest {
+        return Ok(Some(format!(
+            "fixture summary scenario digest mismatch: expected {:?}, got {:?}",
+            scenario_digest, fixture.summary.scenario_digest
+        )));
+    }
+
+    if let Some(snapshot_artifact) = &fixture.snapshot_artifact
+        && snapshot_artifact.metadata.config_identity != effective_config.metadata.identity
+    {
+        return Ok(Some(format!(
+            "snapshot config identity mismatch: expected {:?}, got {:?}",
+            effective_config.metadata.identity, snapshot_artifact.metadata.config_identity
+        )));
+    }
+
+    Ok(None)
 }
 
 fn compare_optional_snapshot_artifacts<Snapshot, SnapshotSerializer>(
@@ -442,6 +658,13 @@ where
         )));
     }
 
+    if expected.metadata.config_identity != actual.metadata.config_identity {
+        return Ok(Some(format!(
+            "snapshot config identity mismatch: expected {:?}, got {:?}",
+            expected.metadata.config_identity, actual.metadata.config_identity
+        )));
+    }
+
     if expected.metadata.engine_family != actual.metadata.engine_family {
         return Ok(Some(format!(
             "snapshot engine family mismatch: expected `{}`, got `{}`",
@@ -473,6 +696,114 @@ where
     }
 
     Ok(None)
+}
+
+fn encode_fixture_summary(writer: &mut CanonicalLineWriter, summary: &GoldenFixtureSummary) {
+    writer.push_str_hex("summary.engine_family_hex", &summary.engine_family);
+    writer.push_display("summary.base_seed", summary.base_seed);
+    writer.push_display("summary.final_tick", summary.final_tick);
+    writer.push_display("summary.final_checksum", summary.final_checksum);
+    writer.push_display(
+        "summary.config_payload_schema_version",
+        summary.config_payload_schema_version,
+    );
+    writer.push_display("summary.config_digest", summary.config_digest);
+    writer.push_display(
+        "summary.replay_artifact_schema_version",
+        summary.replay_artifact_schema_version,
+    );
+    writer.push_display(
+        "summary.snapshot_artifact_schema_version",
+        summary.snapshot_artifact_schema_version,
+    );
+    writer.push_display(
+        "summary.command_payload_schema_version",
+        summary.command_payload_schema_version,
+    );
+    writer.push_display(
+        "summary.snapshot_payload_schema_version",
+        summary.snapshot_payload_schema_version,
+    );
+    writer.push_display("summary.replay_digest", summary.replay_digest);
+    writer.push_display(
+        "summary.snapshot_digest.present",
+        encode_bool(summary.snapshot_digest.is_some()),
+    );
+    if let Some(snapshot_digest) = summary.snapshot_digest {
+        writer.push_display("summary.snapshot_digest", snapshot_digest);
+    }
+    writer.push_display(
+        "summary.scenario_digest.present",
+        encode_bool(summary.scenario_digest.is_some()),
+    );
+    if let Some(scenario_digest) = summary.scenario_digest {
+        writer.push_display("summary.scenario_digest", scenario_digest);
+    }
+}
+
+fn decode_fixture_summary(
+    reader: &mut CanonicalLineReader<'_>,
+) -> Result<GoldenFixtureSummary, EngineError> {
+    Ok(GoldenFixtureSummary {
+        engine_family: decode_hex_string(
+            read_fixture_value(reader, "summary.engine_family_hex")?,
+            "golden fixture summary engine family",
+        )
+        .map_err(golden_fixture_corrupted)?,
+        base_seed: parse_u64(read_fixture_value(reader, "summary.base_seed")?)?,
+        final_tick: parse_u64(read_fixture_value(reader, "summary.final_tick")?)?,
+        final_checksum: parse_u64(read_fixture_value(reader, "summary.final_checksum")?)?,
+        config_payload_schema_version: parse_u32(read_fixture_value(
+            reader,
+            "summary.config_payload_schema_version",
+        )?)?,
+        config_digest: parse_u64(read_fixture_value(reader, "summary.config_digest")?)?,
+        replay_artifact_schema_version: parse_u32(read_fixture_value(
+            reader,
+            "summary.replay_artifact_schema_version",
+        )?)?,
+        snapshot_artifact_schema_version: parse_u32(read_fixture_value(
+            reader,
+            "summary.snapshot_artifact_schema_version",
+        )?)?,
+        command_payload_schema_version: parse_u32(read_fixture_value(
+            reader,
+            "summary.command_payload_schema_version",
+        )?)?,
+        snapshot_payload_schema_version: parse_u32(read_fixture_value(
+            reader,
+            "summary.snapshot_payload_schema_version",
+        )?)?,
+        replay_digest: parse_u64(read_fixture_value(reader, "summary.replay_digest")?)?,
+        snapshot_digest: {
+            let present = parse_bool(read_fixture_value(
+                reader,
+                "summary.snapshot_digest.present",
+            )?)?;
+            if present {
+                Some(parse_u64(read_fixture_value(
+                    reader,
+                    "summary.snapshot_digest",
+                )?)?)
+            } else {
+                None
+            }
+        },
+        scenario_digest: {
+            let present = parse_bool(read_fixture_value(
+                reader,
+                "summary.scenario_digest.present",
+            )?)?;
+            if present {
+                Some(parse_u64(read_fixture_value(
+                    reader,
+                    "summary.scenario_digest",
+                )?)?)
+            } else {
+                None
+            }
+        },
+    })
 }
 
 fn golden_fixture_corrupted(error: impl ToString) -> EngineError {

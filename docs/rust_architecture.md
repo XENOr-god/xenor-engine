@@ -2,7 +2,7 @@
 
 ## Goals
 
-- deterministic-first execution from `seed + ordered input frames`
+- deterministic-first execution from `typed config + seed + ordered input frames`
 - replayability as a first-class debugging and validation surface
 - explicit subsystem boundaries that remain testable in isolation
 - clean separation between engine core and external consumers such as
@@ -22,13 +22,16 @@
 
 `xenor-engine` should center on one narrow contract:
 
-`seed + ordered input frames + phase ordering + serializer version -> identical snapshots, checksums, and replay results`
+`typed config + seed + ordered input frames + phase ordering + schema versions -> identical snapshots, checksums, replay results, and parity summaries`
 
 The engine is best treated as a deterministic execution kernel composed of:
 
 - `core`
   Shared deterministic types, error model, seed/tick helpers, and checksum
   utilities. This layer does not depend on runtime orchestration.
+- `config`
+  Typed simulation configuration, canonical config artifacts, and config
+  identity digests that remain separate from replay input and runtime state.
 - `state`
   Authoritative simulation state and snapshot projection contract.
 - `input`
@@ -40,11 +43,17 @@ The engine is best treated as a deterministic execution kernel composed of:
   tick context.
 - `scheduler`
   Fixed, inspectable ordering across phases/systems.
+- `validation`
+  Explicit invariant checkpoints and validation policy for deterministic
+  state-authority enforcement.
 - `replay`
   Deterministic recording of inputs, phase execution, snapshots, and checksums.
 - `serialization`
-  Deterministic command and snapshot payload encoding with explicit payload
-  schema versioning.
+  Deterministic config, command, and snapshot payload encoding with explicit
+  payload schema versioning.
+- `scenario`
+  Deterministic scenario contract over config, seed, ordered frames, and
+  optional expected parity summary.
 - `fixture`
   Canonical golden fixture generation, import/export, and verification for
   replay-based regression and future parity work.
@@ -89,12 +98,15 @@ rust/
   src/
     lib.rs
     core/
+    config/
     state/
     input/
     rng/
+    validation/
     replay/
     persistence/
     serialization/
+    scenario/
     fixture/
     parity/
     phases/
@@ -108,6 +120,8 @@ rust/
 
 - `core`
   Seed/tick/checksum helpers, deterministic errors, shared scalar types.
+- `config`
+  `ConfigArtifact`, config identity digesting, and typed runtime/init contract.
 - `state`
   `SimulationState` contract and canonical snapshot boundary inside the Rust
   architecture.
@@ -133,8 +147,13 @@ rust/
   `Phase` trait and `TickContext`.
 - `scheduler`
   `Scheduler` trait and fixed-order scheduler implementation.
+- `validation`
+  `StateValidator`, `ValidationPolicy`, explicit checkpoints, and deterministic
+  validation summaries recorded into replay.
 - `engine`
   `Engine` trait and concrete deterministic engine loop.
+- `scenario`
+  Versioned scenario artifacts, scenario execution, and scenario verification.
 - `api`
   Stable consumer-facing entry points and sample engine construction.
 - `bindings`
@@ -144,22 +163,27 @@ rust/
 
 - `core`
   Depends on nothing else.
-- `input`, `state`, `rng`
+- `config`, `input`, `state`, `rng`
   May depend on `core` only.
+- `validation`
+  May depend on `core` and `state`.
 - `replay`
-  May depend on `core`, `input`, `state`.
+  May depend on `core`, `input`, `state`, `validation`.
 - `persistence`
-  May depend on `core`, `input`, `state`, `replay`, `engine`, and
+  May depend on `core`, `config`, `input`, `state`, `replay`, `engine`, and
   `serialization`.
 - `serialization`
-  May depend on `core`, `state`, `input`.
+  May depend on `core`, `config`, `state`, `input`, and `validation`.
 - `phases`
   May depend on `core`, `input`, `state`, `rng`, `replay`.
 - `scheduler`
   May depend on `core`, `phases`.
 - `engine`
-  May depend on `core`, `input`, `state`, `rng`, `replay`, `serialization`,
-  `scheduler`, `phases`.
+  May depend on `core`, `input`, `state`, `rng`, `replay`, `validation`,
+  `serialization`, `scheduler`, `phases`.
+- `scenario`
+  May depend on `config`, `core`, `input`, `parity`, `persistence`, and
+  `serialization`.
 - `api`
   May depend on `engine` and public types from inner modules.
 - `bindings`
@@ -258,19 +282,24 @@ trait Serializer<T> {
 
 1. Caller passes an explicit `InputFrame`.
 2. Engine validates strict ordered tick progression and fails fast on gaps or rewinds.
-3. Engine derives a deterministic tick seed from the base seed and tick number.
-4. Engine begins an append-only replay record for that tick.
-5. Scheduler visits phases in stable grouped order:
+3. Engine treats typed config as part of deterministic identity and uses it to
+   construct initial state, snapshot cadence policy, and validation policy.
+4. Engine derives a deterministic tick seed from the base seed and tick number.
+5. Engine begins an append-only replay record for that tick.
+6. Engine runs explicit invariant validation at `BeforeTickBegin`.
+7. Scheduler visits phases in stable grouped order:
    `PreInput -> Input -> Simulation -> PostSimulation -> Finalize`.
-6. Each phase mutates state through `TickContext`.
-7. Each phase derives its own RNG stream from the tick seed plus a stable stream
-   label.
-8. Engine advances authoritative tick metadata after all phases succeed.
-9. Engine computes the authoritative checksum.
-10. Engine applies explicit snapshot cadence policy:
+8. Engine runs validation again at group boundaries according to policy:
+   `AfterInputApplied`, `AfterSimulationGroup`, and `AfterFinalize`.
+9. Each phase mutates state through `TickContext`.
+10. Each phase derives its own RNG stream from the tick seed plus a stable stream
+    label.
+11. Engine advances authoritative tick metadata after all phases succeed.
+12. Engine computes the authoritative checksum.
+13. Engine applies explicit snapshot cadence policy:
     `Never`, `Every { interval }`, or `Manual`.
-11. Engine finalizes the replay tick record with checksum, phase markers, and
-    optional snapshot payload plus snapshot metadata
+14. Engine finalizes the replay tick record with checksum, validation summaries,
+    phase markers, and optional snapshot payload plus snapshot metadata
     `(payload_schema_version, source_tick, capture_checksum)`.
 
 ### Main Loop Pseudocode
@@ -361,10 +390,13 @@ Then branching inside one phase affects only that phase’s local stream.
 - deterministic tick seed per tick
 - phase execution markers
 - per-tick checksum
+- per-tick validation summaries and state digest progression at explicit
+  checkpoints
 - optional snapshots at configured intervals
 - replay artifact metadata:
-  base seed, total ticks, snapshot policy, command payload schema version,
-  snapshot payload schema version, and replay artifact schema version
+  base seed, config identity, total ticks, snapshot policy, command payload
+  schema version, snapshot payload schema version, and replay artifact schema
+  version
 
 The current Rust baseline records replay as append-only tick records, not a flat
 event stream. Each record contains:
@@ -374,10 +406,12 @@ event stream. Each record contains:
 - derived tick seed
 - ordered phase markers with group + ordinal
 - checksum
+- validation summaries
 - optional snapshot record with capture reason, schema version, source tick,
   capture checksum, and payload
 - optional replay inspection view with deterministic per-tick summaries:
-  phase markers, checksum, snapshot presence, and snapshot metadata pointers
+  phase markers, validation checkpoints, checksum, state digest progression,
+  snapshot presence, and snapshot metadata pointers
 
 ### Modes
 
@@ -395,7 +429,8 @@ event stream. Each record contains:
 
 - step-by-step replay through logged tick and phase boundaries
 - divergence detection on first mismatch across input, tick seed, phase marker
-  ordering, checksum, tick count, snapshot metadata, and snapshot payload digest
+  ordering, validation summaries, checksum, tick count, snapshot metadata, and
+  snapshot payload digest
 - snapshot-assisted bisecting when desync begins after a known checkpoint
 - replay/snapshot artifacts suitable for golden fixtures and future Rust/C++
   parity checks
@@ -408,8 +443,8 @@ recorded trace:
 - `ReplayInspectionView`
   Stable top-level trace summary with record count and final tick.
 - `ReplayTickSummary`
-  Per-tick input tick, derived tick seed, phase markers, checksum, and snapshot
-  presence.
+  Per-tick input tick, derived tick seed, validation summaries, phase markers,
+  checksum, state digest progression, and snapshot presence.
 
 This surface is intentionally library-only. It exists to make test failures and
 desync investigation easier without weakening replay strictness.
@@ -424,6 +459,7 @@ raw memory.
 Recommended baseline:
 
 - explicit serializer trait
+- explicit config payload schema version
 - explicit payload schema version
 - explicit replay artifact schema version
 - explicit snapshot artifact schema version
@@ -462,27 +498,33 @@ If compatibility is not guaranteed, fail fast instead of silently attempting
 replay with mismatched state layouts.
 
 Artifact schema versions and payload schema versions must stay separate.
-Artifacts describe bundle/container layout. Payload schemas describe command and
-snapshot contracts. The decoder must never guess between them.
+Artifacts describe bundle/container layout. Payload schemas describe config,
+command, and snapshot contracts. The decoder must never guess between them.
 
 ## Golden Fixtures + Parity Prep
 
 The Rust baseline now treats golden fixtures as a first-class library surface.
 
 - `GoldenFixture`
-  Versioned bundle containing replay artifact, optional snapshot artifact, and a
-  summary.
+  Versioned bundle containing config artifact, optional scenario artifact,
+  replay artifact, optional snapshot artifact, and a summary.
 - `GoldenFixtureSummary`
-  Stable summary with seed, final tick, final checksum, schema versions, replay
-  digest, and optional snapshot digest.
+  Stable summary with config identity, seed, final tick, final checksum, schema
+  versions, replay digest, optional snapshot digest, and optional scenario
+  digest.
 - `GoldenFixtureResult`
-  Verification report containing summary comparison plus replay/snapshot
-  mismatch details.
+  Verification report containing summary comparison plus separated config,
+  replay, and snapshot mismatch details.
+- `SimulationScenario`
+  Versioned scenario contract over config artifact, seed, ordered frames, and
+  optional expected parity summary.
 - `ParityArtifactSummary`
-  Minimal digest-oriented summary for future Rust/C++ comparison.
+  Minimal digest-oriented summary for future Rust/C++ comparison, now including
+  config schema/digest and optional scenario digest.
 - `ParityComparison`
-  Ordered mismatch list across base seed, final tick, final checksum, replay
-  digest, and optional snapshot digest.
+  Ordered mismatch list across config schema/digest, base seed, final tick,
+  final checksum, replay digest, optional snapshot digest, and optional
+  scenario digest.
 
 This is deliberately library-level only. There is no large file-I/O layer here.
 The goal is to make parity fixtures deterministic, inspectable, and easy to
@@ -571,21 +613,28 @@ assert in tests before any external Rust/C++ integration is attempted.
 The repository now includes an isolated Rust core under `rust/` with:
 
 - explicit module boundaries matching this document
+- typed simulation config artifacts with canonical identity digests
 - a deterministic tick pipeline with strict ordered-input validation
 - grouped fixed scheduler inspection through `PhaseDescriptor` and `PhaseGroup`
-- append-only replay tick records with phase markers and divergence checking
+- append-only replay tick records with phase markers, validation summaries, and
+  richer divergence checking
 - explicit snapshot cadence policy through `SnapshotPolicy`
 - versioned replay artifact persistence with deterministic encode/decode
 - versioned snapshot artifacts with metadata validation on restore
-- canonical golden fixture generation, import/export, and verification
-- parity summary and comparison helpers for future Rust/C++ fixture work
+- canonical scenario artifacts plus scenario execution/verification helpers
+- canonical golden fixture generation, import/export, and config-aware
+  verification
+- parity summary and comparison helpers for future Rust/C++ fixture work,
+  including config identity
 - replay inspection views for deterministic mismatch debugging
+- explicit invariant validation policy at tick boundaries or every phase group
 - fast-forward replay verification from compatible snapshot checkpoints
 - one example state type and command pipeline that makes phase ordering observable
 - one deterministic serializer example
 - regression tests for replay equality, canonical re-export, schema version
-  gating, golden fixture verification, snapshot-backed resume, replay inspection,
-  parity summaries, and richer replay divergence reporting
+  gating, config/scenario roundtrips, golden fixture verification,
+  snapshot-backed resume, replay inspection, invariant enforcement, scenario
+  execution, parity summaries, and richer replay divergence reporting
 
 This Rust core remains intentionally narrow. It is a deterministic architecture
 and validation surface for future native and web bindings, not a replacement

@@ -1,4 +1,4 @@
-use crate::core::{Tick, checksum_words};
+use crate::core::{Seed, Tick, checksum_words, mix64, tick_seed};
 
 pub trait SimulationState: Clone {
     type Snapshot: Clone + Eq + std::fmt::Debug;
@@ -42,6 +42,14 @@ pub struct CounterSnapshot {
 }
 
 impl CounterState {
+    pub fn with_initial_conditions(value: i64, velocity: i64) -> Self {
+        Self {
+            value,
+            velocity,
+            ..Self::default()
+        }
+    }
+
     pub const fn value(&self) -> i64 {
         self.value
     }
@@ -96,7 +104,7 @@ impl CounterState {
         self.finalize_marker = marker;
     }
 
-    fn snapshot_checksum_words(snapshot: &CounterSnapshot) -> [u64; 7] {
+    pub(crate) fn snapshot_checksum_words(snapshot: &CounterSnapshot) -> [u64; 7] {
         [
             snapshot.tick,
             snapshot.value as u64,
@@ -106,6 +114,16 @@ impl CounterState {
             snapshot.entropy_budget,
             snapshot.finalize_marker,
         ]
+    }
+
+    pub fn preview_finalize_marker(&self, seed: Seed, tick: Tick) -> u64 {
+        let mut snapshot = self.snapshot();
+        snapshot.finalize_marker = 0;
+        mix64(
+            tick_seed(seed, tick)
+                ^ checksum_words(&Self::snapshot_checksum_words(&snapshot))
+                ^ tick,
+        )
     }
 }
 

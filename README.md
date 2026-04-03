@@ -212,17 +212,30 @@ The current repository does not provide:
 The Rust workspace under `rust/` is now positioned as a determinism and
 artifact-validation surface, not a replacement for the legacy C++ runtime.
 
+- typed simulation config is part of deterministic identity:
+  initial state, snapshot policy, validation policy, and deterministic limits
+  are exported as canonical config artifacts with explicit payload schema and
+  digest
 - replay, snapshot, and golden fixture exports use canonical text encoding with
   fixed headers, fixed field order, hex-escaped free-form strings, and fail-fast
   decode on duplicate, missing, reordered, or trailing malformed fields
-- artifact schema versions stay separate from command payload schema versions
+- artifact schema versions stay separate from config payload, command payload,
   and snapshot payload schema versions
-- golden fixtures bundle replay artifact, optional snapshot artifact, and a
-  versioned summary for future Rust/C++ parity validation
-- parity summaries compare base seed, final tick, final checksum, replay digest,
-  and optional snapshot digest
+- validation policy is explicit:
+  `TickBoundary` records `BeforeTickBegin` and `AfterFinalize`,
+  `EveryPhase` additionally records `AfterInputApplied` and
+  `AfterSimulationGroup`
 - replay inspection helpers expose deterministic per-tick summaries with phase
-  markers, checksum, and snapshot presence for debugging mismatches
+  markers, validation checkpoints, checksum, state digest progression, and
+  snapshot presence for debugging mismatches
+- scenario artifacts canonically encode `config + base_seed + ordered frames`
+  as a reusable deterministic execution contract for fixtures and parity prep
+- golden fixtures now bundle config artifact, optional scenario artifact,
+  replay artifact, optional snapshot artifact, and a versioned summary for
+  future Rust/C++ parity validation
+- parity summaries compare config schema/digest, base seed, final tick, final
+  checksum, replay digest, optional snapshot digest, and optional scenario
+  digest
 
 ## Development Notes
 
@@ -231,8 +244,10 @@ artifact-validation surface, not a replacement for the legacy C++ runtime.
 - Prefer the step-context RNG over ambient global randomness.
 - Keep scheduler group order explicit: `PreInput -> Input -> Simulation -> PostSimulation -> Finalize`.
 - Capture snapshots only through an explicit cadence policy; do not make them implicit side effects.
-- Treat replay and snapshot artifacts as versioned compatibility boundaries, not ad hoc dumps.
-- Keep artifact schema versions distinct from payload schema versions; never guess payload contracts during decode.
+- Treat config, scenario, replay, snapshot, and fixture artifacts as versioned compatibility boundaries, not ad hoc dumps.
+- Keep artifact schema versions distinct from config/command/snapshot payload schema versions; never guess payload contracts during decode.
+- Treat deterministic config as part of replay identity, not a convenience default hidden behind seed + inputs.
+- Keep validation checkpoints explicit in the pipeline; do not hide invariant enforcement behind ad hoc debug code.
 - Keep snapshot payload conversion and payload migration in adapters.
 - Do not treat `last_completed_tick` as payload-owned state.
 - Use append-only replay traces and divergence checks for inspection and regression validation, not as a persistence format.

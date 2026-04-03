@@ -9,12 +9,15 @@ pub struct ParityArtifactSummary {
     pub base_seed: Seed,
     pub final_tick: Tick,
     pub final_checksum: u64,
+    pub config_payload_schema_version: u32,
+    pub config_digest: u64,
     pub replay_artifact_schema_version: u32,
     pub snapshot_artifact_schema_version: u32,
     pub command_payload_schema_version: u32,
     pub snapshot_payload_schema_version: u32,
     pub replay_digest: u64,
     pub snapshot_digest: Option<u64>,
+    pub scenario_digest: Option<u64>,
 }
 
 impl From<&ArtifactSummary> for ParityArtifactSummary {
@@ -24,12 +27,15 @@ impl From<&ArtifactSummary> for ParityArtifactSummary {
             base_seed: value.base_seed,
             final_tick: value.final_tick,
             final_checksum: value.final_checksum,
+            config_payload_schema_version: value.config_payload_schema_version,
+            config_digest: value.config_digest,
             replay_artifact_schema_version: value.replay_artifact_schema_version,
             snapshot_artifact_schema_version: value.snapshot_artifact_schema_version,
             command_payload_schema_version: value.command_payload_schema_version,
             snapshot_payload_schema_version: value.snapshot_payload_schema_version,
             replay_digest: value.replay_digest,
             snapshot_digest: value.snapshot_digest,
+            scenario_digest: value.scenario_digest,
         }
     }
 }
@@ -48,11 +54,23 @@ pub enum ParityMismatch {
         expected: u64,
         actual: u64,
     },
+    ConfigSchemaVersion {
+        expected: u32,
+        actual: u32,
+    },
+    ConfigDigest {
+        expected: u64,
+        actual: u64,
+    },
     ReplayDigest {
         expected: u64,
         actual: u64,
     },
     SnapshotDigest {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    ScenarioDigest {
         expected: Option<u64>,
         actual: Option<u64>,
     },
@@ -73,6 +91,18 @@ impl fmt::Display for ParityMismatch {
                     "final checksum mismatch: expected {expected}, got {actual}"
                 )
             }
+            Self::ConfigSchemaVersion { expected, actual } => {
+                write!(
+                    f,
+                    "config schema version mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::ConfigDigest { expected, actual } => {
+                write!(
+                    f,
+                    "config digest mismatch: expected {expected}, got {actual}"
+                )
+            }
             Self::ReplayDigest { expected, actual } => {
                 write!(
                     f,
@@ -83,6 +113,13 @@ impl fmt::Display for ParityMismatch {
                 write!(
                     f,
                     "snapshot digest mismatch: expected {:?}, got {:?}",
+                    expected, actual
+                )
+            }
+            Self::ScenarioDigest { expected, actual } => {
+                write!(
+                    f,
+                    "scenario digest mismatch: expected {:?}, got {:?}",
                     expected, actual
                 )
             }
@@ -165,6 +202,20 @@ pub fn compare_parity_summaries(
         });
     }
 
+    if expected.config_payload_schema_version != actual.config_payload_schema_version {
+        mismatches.push(ParityMismatch::ConfigSchemaVersion {
+            expected: expected.config_payload_schema_version,
+            actual: actual.config_payload_schema_version,
+        });
+    }
+
+    if expected.config_digest != actual.config_digest {
+        mismatches.push(ParityMismatch::ConfigDigest {
+            expected: expected.config_digest,
+            actual: actual.config_digest,
+        });
+    }
+
     if expected.replay_digest != actual.replay_digest {
         mismatches.push(ParityMismatch::ReplayDigest {
             expected: expected.replay_digest,
@@ -176,6 +227,13 @@ pub fn compare_parity_summaries(
         mismatches.push(ParityMismatch::SnapshotDigest {
             expected: expected.snapshot_digest,
             actual: actual.snapshot_digest,
+        });
+    }
+
+    if expected.scenario_digest != actual.scenario_digest {
+        mismatches.push(ParityMismatch::ScenarioDigest {
+            expected: expected.scenario_digest,
+            actual: actual.scenario_digest,
         });
     }
 

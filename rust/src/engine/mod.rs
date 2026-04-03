@@ -10,6 +10,10 @@ use crate::rng::Rng;
 use crate::scheduler::{FixedScheduler, PhaseDescriptor, Scheduler};
 use crate::serialization::Serializer;
 use crate::state::SimulationState;
+use crate::validation::{
+    NoopStateValidator, StateValidator, ValidationCheckpoint, ValidationContext, ValidationPolicy,
+    ValidationSummary,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotPolicy {
@@ -19,6 +23,25 @@ pub enum SnapshotPolicy {
 }
 
 impl SnapshotPolicy {
+    pub fn canonical_string(self) -> String {
+        match self {
+            Self::Never => "never".into(),
+            Self::Every { interval } => format!("every:{interval}"),
+            Self::Manual => "manual".into(),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "never" => Some(Self::Never),
+            "manual" => Some(Self::Manual),
+            _ => value
+                .strip_prefix("every:")
+                .and_then(|interval| interval.parse().ok())
+                .map(|interval| Self::Every { interval }),
+        }
+    }
+
     pub const fn should_capture(self, tick: Tick) -> Option<SnapshotCaptureReason> {
         match self {
             Self::Never | Self::Manual => None,
@@ -51,23 +74,26 @@ pub trait ReplayableEngine<C: Command>: Engine<C> {
     fn replay_records(&self) -> &[ReplayTickRecord<C, <Self::State as SimulationState>::Snapshot>];
 }
 
-pub struct DeterministicEngine<S, C, R, L, Sch = FixedScheduler<S, C, R, L>>
+pub struct DeterministicEngine<S, C, R, L, Sch = FixedScheduler<S, C, R, L>, V = NoopStateValidator>
 where
     S: SimulationState,
     C: Command,
     R: Rng,
     L: ReplayLog<C, S::Snapshot>,
     Sch: Scheduler<S, C, R, L>,
+    V: StateValidator<S>,
 {
     seed: Seed,
     state: S,
     replay_log: L,
     scheduler: Sch,
     snapshot_policy: SnapshotPolicy,
+    validation_policy: ValidationPolicy,
+    validator: V,
     _marker: PhantomData<(C, R)>,
 }
 
-impl<S, C, R, L, Sch> DeterministicEngine<S, C, R, L, Sch>
+impl<S, C, R, L, Sch> DeterministicEngine<S, C, R, L, Sch, NoopStateValidator>
 where
     S: SimulationState,
     C: Command,
@@ -82,13 +108,45 @@ where
             replay_log,
             scheduler,
             snapshot_policy: SnapshotPolicy::Never,
+            validation_policy: ValidationPolicy::TickBoundary,
+            validator: NoopStateValidator,
             _marker: PhantomData,
         }
     }
+}
 
+impl<S, C, R, L, Sch, V> DeterministicEngine<S, C, R, L, Sch, V>
+where
+    S: SimulationState,
+    C: Command,
+    R: Rng,
+    L: ReplayLog<C, S::Snapshot>,
+    Sch: Scheduler<S, C, R, L>,
+    V: StateValidator<S>,
+{
     pub fn with_snapshot_policy(mut self, snapshot_policy: SnapshotPolicy) -> Self {
         self.snapshot_policy = snapshot_policy;
         self
+    }
+
+    pub fn with_validator<V2>(
+        self,
+        validator: V2,
+        validation_policy: ValidationPolicy,
+    ) -> DeterministicEngine<S, C, R, L, Sch, V2>
+    where
+        V2: StateValidator<S>,
+    {
+        DeterministicEngine {
+            seed: self.seed,
+            state: self.state,
+            replay_log: self.replay_log,
+            scheduler: self.scheduler,
+            snapshot_policy: self.snapshot_policy,
+            validation_policy,
+            validator,
+            _marker: PhantomData,
+        }
     }
 
     pub fn replay_log(&self) -> &L {
@@ -101,6 +159,10 @@ where
 
     pub const fn snapshot_policy(&self) -> SnapshotPolicy {
         self.snapshot_policy
+    }
+
+    pub const fn validation_policy(&self) -> ValidationPolicy {
+        self.validation_policy
     }
 
     pub fn manual_snapshot(&self) -> SnapshotRecord<S::Snapshot> {
@@ -158,15 +220,42 @@ where
         self.replay_log.begin_tick(frame, tick_seed)
     }
 
+    fn run_validation_checkpoint(
+        &mut self,
+        checkpoint: ValidationCheckpoint,
+        tick: Tick,
+        tick_seed: Seed,
+    ) -> Result<(), EngineError> {
+        if !self.validation_policy.should_validate(checkpoint) {
+            return Ok(());
+        }
+
+        let context = ValidationContext {
+            checkpoint,
+            tick,
+            tick_seed,
+        };
+        self.validator.validate(context, &self.state)?;
+        self.replay_log.record_validation(ValidationSummary {
+            checkpoint,
+            state_tick: self.state.tick(),
+            state_digest: self.state.checksum(),
+        })
+    }
+
     fn run_scheduler_phases(
         &mut self,
         frame: &InputFrame<C>,
         tick: Tick,
         tick_seed: Seed,
     ) -> Result<(), EngineError> {
+        let plan = self.scheduler.phase_plan();
+        let mut phase_index = 0usize;
         let seed = self.seed;
         let state = &mut self.state;
         let replay = &mut self.replay_log;
+        let validation_policy = self.validation_policy;
+        let validator = &self.validator;
 
         let mut visitor = |descriptor: PhaseDescriptor,
                            phase: &mut dyn Phase<S, C, R, L>|
@@ -182,7 +271,52 @@ where
                     group: descriptor.group.as_str(),
                     phase: descriptor.name,
                     reason: error.to_string(),
-                })
+                })?;
+
+            let next_group = plan.get(phase_index + 1).map(|entry| entry.group);
+            phase_index += 1;
+            let checkpoint = match (descriptor.group, next_group) {
+                (crate::scheduler::PhaseGroup::Input, Some(next))
+                    if next != crate::scheduler::PhaseGroup::Input =>
+                {
+                    Some(ValidationCheckpoint::AfterInputApplied)
+                }
+                (crate::scheduler::PhaseGroup::Input, None) => {
+                    Some(ValidationCheckpoint::AfterInputApplied)
+                }
+                (crate::scheduler::PhaseGroup::Simulation, Some(next))
+                    if next != crate::scheduler::PhaseGroup::Simulation =>
+                {
+                    Some(ValidationCheckpoint::AfterSimulationGroup)
+                }
+                (crate::scheduler::PhaseGroup::Simulation, None) => {
+                    Some(ValidationCheckpoint::AfterSimulationGroup)
+                }
+                (crate::scheduler::PhaseGroup::Finalize, _) => {
+                    Some(ValidationCheckpoint::AfterFinalize)
+                }
+                _ => None,
+            };
+
+            if let Some(checkpoint) =
+                checkpoint.filter(|checkpoint| validation_policy.should_validate(*checkpoint))
+            {
+                validator.validate(
+                    ValidationContext {
+                        checkpoint,
+                        tick,
+                        tick_seed,
+                    },
+                    state,
+                )?;
+                replay.record_validation(ValidationSummary {
+                    checkpoint,
+                    state_tick: state.tick(),
+                    state_digest: state.checksum(),
+                })?;
+            }
+
+            Ok(())
         };
 
         self.scheduler.visit_phases(&mut visitor)
@@ -224,13 +358,14 @@ where
     }
 }
 
-impl<S, C, R, L, Sch> Engine<C> for DeterministicEngine<S, C, R, L, Sch>
+impl<S, C, R, L, Sch, V> Engine<C> for DeterministicEngine<S, C, R, L, Sch, V>
 where
     S: SimulationState,
     C: Command,
     R: Rng,
     L: ReplayLog<C, S::Snapshot>,
     Sch: Scheduler<S, C, R, L>,
+    V: StateValidator<S>,
 {
     type State = S;
 
@@ -246,6 +381,7 @@ where
         let tick = self.validate_ordered_input(&frame)?;
         let tick_seed = self.derive_tick_seed(tick);
         self.record_replay_input_begin(&frame, tick_seed)?;
+        self.run_validation_checkpoint(ValidationCheckpoint::BeforeTickBegin, tick, tick_seed)?;
         self.run_scheduler_phases(&frame, tick, tick_seed)?;
         self.advance_authoritative_tick(tick);
         let checksum = self.compute_checksum();
@@ -263,13 +399,14 @@ where
     }
 }
 
-impl<S, C, R, L, Sch> ReplayableEngine<C> for DeterministicEngine<S, C, R, L, Sch>
+impl<S, C, R, L, Sch, V> ReplayableEngine<C> for DeterministicEngine<S, C, R, L, Sch, V>
 where
     S: SimulationState,
     C: Command,
     R: Rng,
     L: ReplayLog<C, S::Snapshot>,
     Sch: Scheduler<S, C, R, L>,
+    V: StateValidator<S>,
 {
     fn snapshot_policy(&self) -> SnapshotPolicy {
         self.snapshot_policy

@@ -1,3 +1,4 @@
+use crate::config::{ConfigArtifact, ConfigArtifactSerializer, CounterSimulationConfig};
 use crate::core::{EngineError, Seed, Tick, mix64};
 use crate::engine::{DeterministicEngine, Engine, SnapshotPolicy};
 use crate::fixture::{GoldenFixture, GoldenFixtureResult, GoldenFixtureSerializer};
@@ -11,11 +12,17 @@ use crate::persistence::{
 use crate::phases::{Phase, TickContext};
 use crate::replay::{InMemoryReplayLog, ReplayInspectionView, inspect_replay_trace};
 use crate::rng::{Rng, SplitMix64};
+use crate::scenario::{
+    ScenarioExecutionResult, ScenarioVerificationResult, SimulationScenario,
+    SimulationScenarioSerializer,
+};
 use crate::scheduler::{FixedScheduler, PhaseGroup};
 use crate::serialization::{
-    CounterCommandTextSerializer, CounterSnapshotTextSerializer, Serializer,
+    CounterCommandTextSerializer, CounterConfigTextSerializer, CounterSnapshotTextSerializer,
+    Serializer,
 };
 use crate::state::{CounterSnapshot, CounterState, SimulationState};
+use crate::validation::{StateValidator, ValidationCheckpoint, ValidationContext};
 
 pub const COUNTER_ENGINE_FAMILY: &str = "xenor-engine-rust/counter";
 
@@ -38,6 +45,206 @@ pub struct CounterCommand {
     pub consume_entropy: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterStateValidator {
+    seed: Seed,
+    config: CounterSimulationConfig,
+}
+
+impl CounterStateValidator {
+    pub fn new(seed: Seed, config: CounterSimulationConfig) -> Self {
+        Self { seed, config }
+    }
+
+    fn invariant_error(
+        &self,
+        context: ValidationContext,
+        detail: impl Into<String>,
+    ) -> EngineError {
+        EngineError::InvariantViolation {
+            tick: context.tick,
+            checkpoint: context.checkpoint.as_str(),
+            detail: detail.into(),
+        }
+    }
+
+    fn expect_tick_alignment(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        let expected_state_tick = context.tick.saturating_sub(1);
+        if state.tick() != expected_state_tick {
+            return Err(self.invariant_error(
+                context,
+                format!(
+                    "authoritative tick mismatch: expected {}, got {}",
+                    expected_state_tick,
+                    state.tick()
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn expect_within_limit(
+        &self,
+        context: ValidationContext,
+        label: &str,
+        value: i64,
+        limit: i64,
+    ) -> Result<(), EngineError> {
+        let magnitude = i128::from(value).abs();
+        let limit = i128::from(limit);
+        if magnitude > limit {
+            return Err(self.invariant_error(
+                context,
+                format!("{label} exceeded deterministic limit: value={value}, limit={limit}"),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn expect_limits(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        self.expect_within_limit(context, "value", state.value(), self.config.max_abs_value)?;
+        self.expect_within_limit(
+            context,
+            "velocity",
+            state.velocity(),
+            self.config.max_abs_velocity,
+        )?;
+        self.expect_within_limit(
+            context,
+            "pending_delta",
+            state.pending_delta(),
+            self.config.max_abs_pending_delta,
+        )
+    }
+
+    fn expect_pending_cleared(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        if state.pending_delta() != 0 {
+            return Err(self.invariant_error(
+                context,
+                format!("pending_delta must be 0, got {}", state.pending_delta()),
+            ));
+        }
+
+        if state.pending_entropy() != 0 {
+            return Err(self.invariant_error(
+                context,
+                format!("pending_entropy must be 0, got {}", state.pending_entropy()),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn expect_marker_zero(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        if state.finalize_marker() != 0 {
+            return Err(self.invariant_error(
+                context,
+                format!(
+                    "finalize_marker must be cleared, got {}",
+                    state.finalize_marker()
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn expect_previous_marker(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        if state.tick() == 0 {
+            return self.expect_marker_zero(context, state);
+        }
+
+        if state.finalize_marker() == 0 {
+            return Err(self.invariant_error(
+                context,
+                format!(
+                    "finalize_marker missing for completed tick {}",
+                    state.tick(),
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn expect_current_marker(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        let expected_marker = state.preview_finalize_marker(self.seed, context.tick);
+        if state.finalize_marker() != expected_marker {
+            return Err(self.invariant_error(
+                context,
+                format!(
+                    "finalize_marker mismatch for tick {}: expected {}, got {}",
+                    context.tick,
+                    expected_marker,
+                    state.finalize_marker()
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl StateValidator<CounterState> for CounterStateValidator {
+    fn validate(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        self.expect_tick_alignment(context, state)?;
+        self.expect_limits(context, state)?;
+
+        match context.checkpoint {
+            ValidationCheckpoint::BeforeTickBegin => {
+                self.expect_pending_cleared(context, state)?;
+                self.expect_previous_marker(context, state)?;
+            }
+            ValidationCheckpoint::AfterInputApplied => {
+                self.expect_marker_zero(context, state)?;
+            }
+            ValidationCheckpoint::AfterSimulationGroup => {
+                self.expect_marker_zero(context, state)?;
+            }
+            ValidationCheckpoint::AfterFinalize => {
+                self.expect_pending_cleared(context, state)?;
+                self.expect_current_marker(context, state)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub type CounterConfig = CounterSimulationConfig;
+pub type CounterConfigArtifact = ConfigArtifact<CounterSimulationConfig>;
+pub type CounterConfigArtifactCodec =
+    ConfigArtifactSerializer<CounterSimulationConfig, CounterConfigTextSerializer>;
 pub type CounterReplayLog = InMemoryReplayLog<CounterCommand, CounterSnapshot>;
 pub type CounterScheduler =
     FixedScheduler<CounterState, CounterCommand, SplitMix64, CounterReplayLog>;
@@ -47,6 +254,7 @@ pub type CounterEngine = DeterministicEngine<
     SplitMix64,
     CounterReplayLog,
     CounterScheduler,
+    CounterStateValidator,
 >;
 pub type CounterReplayArtifact = ReplayArtifact<CounterCommand, CounterSnapshot>;
 pub type CounterSnapshotArtifact = SnapshotArtifact<CounterSnapshot>;
@@ -60,13 +268,26 @@ pub type CounterReplayArtifactCodec = ReplayArtifactSerializer<
 >;
 pub type CounterSnapshotArtifactCodec =
     SnapshotArtifactSerializer<CounterSnapshot, CounterSnapshotTextSerializer>;
-pub type CounterGoldenFixture = GoldenFixture<CounterCommand, CounterSnapshot>;
+pub type CounterScenario = SimulationScenario<CounterCommand, CounterSimulationConfig>;
+pub type CounterScenarioCodec = SimulationScenarioSerializer<
+    CounterCommand,
+    CounterSimulationConfig,
+    CounterCommandTextSerializer,
+    CounterConfigTextSerializer,
+>;
+pub type CounterScenarioExecutionResult = ScenarioExecutionResult<CounterCommand, CounterSnapshot>;
+pub type CounterScenarioVerificationResult =
+    ScenarioVerificationResult<CounterCommand, CounterSnapshot>;
+pub type CounterGoldenFixture =
+    GoldenFixture<CounterCommand, CounterSnapshot, CounterSimulationConfig>;
 pub type CounterGoldenFixtureResult = GoldenFixtureResult;
 pub type CounterGoldenFixtureCodec = GoldenFixtureSerializer<
     CounterCommand,
     CounterSnapshot,
+    CounterSimulationConfig,
     CounterCommandTextSerializer,
     CounterSnapshotTextSerializer,
+    CounterConfigTextSerializer,
 >;
 pub type CounterParitySummary = ParityArtifactSummary;
 
@@ -186,18 +407,78 @@ pub(crate) fn reordered_counter_scheduler() -> CounterScheduler {
     scheduler
 }
 
+fn counter_config_from_policy(snapshot_policy: SnapshotPolicy) -> CounterSimulationConfig {
+    CounterSimulationConfig {
+        snapshot_policy,
+        ..CounterSimulationConfig::default()
+    }
+}
+
+fn build_counter_engine_internal(
+    seed: Seed,
+    scheduler: CounterScheduler,
+    config: CounterSimulationConfig,
+) -> CounterEngine {
+    DeterministicEngine::new(
+        seed,
+        CounterState::with_initial_conditions(config.initial_value, config.initial_velocity),
+        scheduler,
+        CounterReplayLog::default(),
+    )
+    .with_snapshot_policy(config.snapshot_policy)
+    .with_validator(
+        CounterStateValidator::new(seed, config.clone()),
+        config.validation_policy,
+    )
+}
+
+pub fn default_counter_config() -> CounterSimulationConfig {
+    CounterSimulationConfig::default()
+}
+
+pub fn counter_config_with_policy(snapshot_policy: SnapshotPolicy) -> CounterSimulationConfig {
+    counter_config_from_policy(snapshot_policy)
+}
+
+pub fn counter_config_artifact_codec() -> CounterConfigArtifactCodec {
+    ConfigArtifactSerializer::new(COUNTER_ENGINE_FAMILY, CounterConfigTextSerializer)
+}
+
+pub fn build_counter_config_artifact(
+    config: &CounterSimulationConfig,
+) -> Result<CounterConfigArtifact, EngineError> {
+    config.validate()?;
+    counter_config_artifact_codec().build_artifact(config)
+}
+
+pub fn export_counter_config_artifact(
+    artifact: &CounterConfigArtifact,
+) -> Result<Vec<u8>, EngineError> {
+    counter_config_artifact_codec().encode(artifact)
+}
+
+pub fn import_counter_config_artifact(bytes: &[u8]) -> Result<CounterConfigArtifact, EngineError> {
+    counter_config_artifact_codec().decode(bytes)
+}
+
 pub(crate) fn build_counter_engine(
     seed: Seed,
     scheduler: CounterScheduler,
     snapshot_policy: SnapshotPolicy,
 ) -> CounterEngine {
-    DeterministicEngine::new(
+    build_counter_engine_internal(seed, scheduler, counter_config_from_policy(snapshot_policy))
+}
+
+pub fn counter_engine_with_config(
+    seed: Seed,
+    config: &CounterSimulationConfig,
+) -> Result<CounterEngine, EngineError> {
+    config.validate()?;
+    Ok(build_counter_engine_internal(
         seed,
-        CounterState::default(),
-        scheduler,
-        CounterReplayLog::default(),
-    )
-    .with_snapshot_policy(snapshot_policy)
+        default_counter_scheduler(),
+        config.clone(),
+    ))
 }
 
 pub fn counter_engine_with_policy(seed: Seed, snapshot_policy: SnapshotPolicy) -> CounterEngine {
@@ -220,10 +501,86 @@ pub fn counter_snapshot_artifact_codec() -> CounterSnapshotArtifactCodec {
     SnapshotArtifactSerializer::new(COUNTER_ENGINE_FAMILY, CounterSnapshotTextSerializer)
 }
 
+pub fn counter_scenario_codec() -> CounterScenarioCodec {
+    SimulationScenarioSerializer::new(
+        CounterCommandTextSerializer,
+        counter_config_artifact_codec(),
+    )
+}
+
 pub fn counter_golden_fixture_codec() -> CounterGoldenFixtureCodec {
     GoldenFixtureSerializer::new(
         counter_replay_artifact_codec(),
         counter_snapshot_artifact_codec(),
+        counter_config_artifact_codec(),
+        counter_scenario_codec(),
+    )
+}
+
+pub fn build_counter_scenario(
+    config: &CounterSimulationConfig,
+    seed: Seed,
+    frames: &[InputFrame<CounterCommand>],
+    expected_parity_summary: Option<CounterParitySummary>,
+) -> Result<CounterScenario, EngineError> {
+    let config_artifact = build_counter_config_artifact(config)?;
+    Ok(counter_scenario_codec().build_scenario(
+        config_artifact,
+        seed,
+        frames,
+        expected_parity_summary,
+    ))
+}
+
+pub fn export_counter_scenario(scenario: &CounterScenario) -> Result<Vec<u8>, EngineError> {
+    counter_scenario_codec().encode(scenario)
+}
+
+pub fn import_counter_scenario(bytes: &[u8]) -> Result<CounterScenario, EngineError> {
+    counter_scenario_codec().decode(bytes)
+}
+
+pub fn execute_counter_scenario(
+    scenario: &CounterScenario,
+) -> Result<CounterScenarioExecutionResult, EngineError> {
+    counter_scenario_codec().execute::<CounterState, CounterEngine, _, _>(
+        scenario,
+        |seed, config| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
+        &counter_replay_artifact_codec(),
+    )
+}
+
+pub fn verify_counter_scenario(
+    scenario: &CounterScenario,
+) -> Result<CounterScenarioVerificationResult, EngineError> {
+    counter_scenario_codec().verify::<CounterState, CounterEngine, _, _>(
+        scenario,
+        |seed, config| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
+        &counter_replay_artifact_codec(),
+    )
+}
+
+pub fn record_counter_replay_with_config(
+    config: &CounterSimulationConfig,
+    seed: Seed,
+    frames: &[InputFrame<CounterCommand>],
+) -> Result<CounterRecordedReplay, EngineError> {
+    let config_artifact = build_counter_config_artifact(config)?;
+    let codec = counter_replay_artifact_codec();
+    let config = config.clone();
+    record_replay::<CounterCommand, CounterState, CounterEngine, _, _, _>(
+        seed,
+        config.snapshot_policy,
+        config_artifact.metadata.identity,
+        frames,
+        move |seed, _snapshot_policy| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
+        &codec,
     )
 }
 
@@ -232,14 +589,7 @@ pub fn record_counter_replay(
     snapshot_policy: SnapshotPolicy,
     frames: &[InputFrame<CounterCommand>],
 ) -> Result<CounterRecordedReplay, EngineError> {
-    let codec = counter_replay_artifact_codec();
-    record_replay::<CounterCommand, CounterState, CounterEngine, _, _, _>(
-        seed,
-        snapshot_policy,
-        frames,
-        counter_engine_with_policy,
-        &codec,
-    )
+    record_counter_replay_with_config(&counter_config_from_policy(snapshot_policy), seed, frames)
 }
 
 pub fn export_counter_replay_artifact(
@@ -268,19 +618,42 @@ pub fn inspect_counter_replay(artifact: &CounterReplayArtifact) -> ReplayInspect
     inspect_replay_trace(artifact.records.as_slice())
 }
 
-pub fn verify_counter_replay(
+pub fn verify_counter_replay_with_config(
+    config: &CounterSimulationConfig,
     artifact: &CounterReplayArtifact,
 ) -> Result<CounterReplayResult, EngineError> {
+    let config_artifact = build_counter_config_artifact(config)?;
     let codec = counter_replay_artifact_codec();
+    let config = config.clone();
     execute_replay_verify::<CounterCommand, CounterState, CounterEngine, _, _, _>(
         artifact,
-        counter_engine_with_policy,
+        config_artifact.metadata.identity,
+        move |seed, _snapshot_policy| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
         &codec,
     )
 }
 
-pub fn counter_snapshot_artifact_from_engine(engine: &CounterEngine) -> CounterSnapshotArtifact {
-    counter_snapshot_artifact_codec().build_artifact(engine.seed(), &engine.manual_snapshot())
+pub fn verify_counter_replay(
+    artifact: &CounterReplayArtifact,
+) -> Result<CounterReplayResult, EngineError> {
+    verify_counter_replay_with_config(
+        &counter_config_from_policy(artifact.metadata.snapshot_policy),
+        artifact,
+    )
+}
+
+pub fn counter_snapshot_artifact_from_engine(
+    config: &CounterSimulationConfig,
+    engine: &CounterEngine,
+) -> Result<CounterSnapshotArtifact, EngineError> {
+    let config_artifact = build_counter_config_artifact(config)?;
+    Ok(counter_snapshot_artifact_codec().build_artifact(
+        engine.seed(),
+        config_artifact.metadata.identity,
+        &engine.manual_snapshot(),
+    ))
 }
 
 pub fn counter_snapshot_artifact_at_tick(
@@ -296,7 +669,11 @@ pub fn counter_snapshot_artifact_at_tick(
             detail: format!("no snapshot recorded at tick {tick}"),
         })?;
 
-    Ok(counter_snapshot_artifact_codec().build_artifact(artifact.metadata.base_seed, snapshot))
+    Ok(counter_snapshot_artifact_codec().build_artifact(
+        artifact.metadata.base_seed,
+        artifact.metadata.config_identity,
+        snapshot,
+    ))
 }
 
 pub fn export_counter_snapshot_artifact(
@@ -311,16 +688,43 @@ pub fn import_counter_snapshot_artifact(
     counter_snapshot_artifact_codec().decode(bytes)
 }
 
+pub fn generate_counter_golden_fixture_with_config(
+    config: &CounterSimulationConfig,
+    seed: Seed,
+    frames: &[InputFrame<CounterCommand>],
+) -> Result<CounterGoldenFixture, EngineError> {
+    let config_artifact = build_counter_config_artifact(config)?;
+    let config = config.clone();
+    counter_golden_fixture_codec().generate_fixture::<CounterState, CounterEngine, _>(
+        seed,
+        config_artifact,
+        frames,
+        move |seed, _config| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
+    )
+}
+
+pub fn generate_counter_golden_fixture_from_scenario(
+    scenario: &CounterScenario,
+) -> Result<CounterGoldenFixture, EngineError> {
+    counter_golden_fixture_codec().generate_fixture_from_scenario::<CounterState, CounterEngine, _>(
+        scenario,
+        |seed, config| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
+    )
+}
+
 pub fn generate_counter_golden_fixture(
     seed: Seed,
     snapshot_policy: SnapshotPolicy,
     frames: &[InputFrame<CounterCommand>],
 ) -> Result<CounterGoldenFixture, EngineError> {
-    counter_golden_fixture_codec().generate_fixture::<CounterState, CounterEngine, _>(
+    generate_counter_golden_fixture_with_config(
+        &counter_config_from_policy(snapshot_policy),
         seed,
-        snapshot_policy,
         frames,
-        counter_engine_with_policy,
     )
 }
 
@@ -337,20 +741,41 @@ pub fn import_counter_golden_fixture(bytes: &[u8]) -> Result<CounterGoldenFixtur
 pub fn verify_counter_golden_fixture(
     fixture: &CounterGoldenFixture,
 ) -> Result<CounterGoldenFixtureResult, EngineError> {
-    counter_golden_fixture_codec()
-        .verify_fixture::<CounterState, CounterEngine, _>(fixture, counter_engine_with_policy)
+    counter_golden_fixture_codec().verify_fixture::<CounterState, CounterEngine, _>(
+        fixture,
+        |seed, config| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
+    )
+}
+
+pub fn resume_counter_replay_from_snapshot_with_config(
+    config: &CounterSimulationConfig,
+    snapshot: &CounterSnapshotArtifact,
+    artifact: &CounterReplayArtifact,
+) -> Result<CounterReplayResult, EngineError> {
+    let config_artifact = build_counter_config_artifact(config)?;
+    let codec = counter_replay_artifact_codec();
+    let config = config.clone();
+    execute_replay_from_snapshot::<CounterCommand, CounterState, CounterEngine, _, _, _>(
+        snapshot,
+        artifact,
+        config_artifact.metadata.identity,
+        move |seed, _snapshot_policy| {
+            build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
+        },
+        &codec,
+    )
 }
 
 pub fn resume_counter_replay_from_snapshot(
     snapshot: &CounterSnapshotArtifact,
     artifact: &CounterReplayArtifact,
 ) -> Result<CounterReplayResult, EngineError> {
-    let codec = counter_replay_artifact_codec();
-    execute_replay_from_snapshot::<CounterCommand, CounterState, CounterEngine, _, _, _>(
+    resume_counter_replay_from_snapshot_with_config(
+        &counter_config_from_policy(artifact.metadata.snapshot_policy),
         snapshot,
         artifact,
-        counter_engine_with_policy,
-        &codec,
     )
 }
 

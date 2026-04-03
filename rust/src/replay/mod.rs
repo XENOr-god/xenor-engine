@@ -3,6 +3,7 @@ use std::fmt;
 use crate::core::{EngineError, Seed, Tick};
 use crate::input::{Command, InputFrame};
 use crate::scheduler::{PhaseDescriptor, PhaseGroup};
+use crate::validation::{StateDigestProgression, ValidationSummary};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhaseMarker {
@@ -54,6 +55,7 @@ where
     pub input: InputFrame<C>,
     pub tick_seed: Seed,
     pub phase_markers: Vec<PhaseMarker>,
+    pub validation_summaries: Vec<ValidationSummary>,
     pub checksum: u64,
     pub snapshot: Option<SnapshotRecord<Snapshot>>,
 }
@@ -67,6 +69,7 @@ where
     input: InputFrame<C>,
     tick_seed: Seed,
     phase_markers: Vec<PhaseMarker>,
+    validation_summaries: Vec<ValidationSummary>,
 }
 
 pub trait ReplayLog<C, Snapshot>
@@ -76,6 +79,7 @@ where
 {
     fn begin_tick(&mut self, frame: &InputFrame<C>, tick_seed: Seed) -> Result<(), EngineError>;
     fn record_phase(&mut self, marker: PhaseMarker) -> Result<(), EngineError>;
+    fn record_validation(&mut self, summary: ValidationSummary) -> Result<(), EngineError>;
     fn complete_tick(
         &mut self,
         checksum: u64,
@@ -124,6 +128,7 @@ where
             input: frame.clone(),
             tick_seed,
             phase_markers: Vec::new(),
+            validation_summaries: Vec::new(),
         });
 
         Ok(())
@@ -144,6 +149,21 @@ where
         Ok(())
     }
 
+    fn record_validation(&mut self, summary: ValidationSummary) -> Result<(), EngineError> {
+        let pending = self
+            .pending
+            .as_mut()
+            .ok_or_else(|| EngineError::ReplayLifecycle {
+                detail: format!(
+                    "attempted to record validation checkpoint `{}` without a pending replay tick",
+                    summary.checkpoint.as_str()
+                ),
+            })?;
+
+        pending.validation_summaries.push(summary);
+        Ok(())
+    }
+
     fn complete_tick(
         &mut self,
         checksum: u64,
@@ -161,6 +181,7 @@ where
             input: pending.input,
             tick_seed: pending.tick_seed,
             phase_markers: pending.phase_markers,
+            validation_summaries: pending.validation_summaries,
             checksum,
             snapshot,
         });
@@ -174,22 +195,26 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReplayTickSummary {
+pub struct TickLifecycleSummary {
     pub tick: Tick,
     pub input_tick: Tick,
     pub tick_seed: Seed,
     pub phase_markers: Vec<PhaseMarker>,
+    pub validation_summaries: Vec<ValidationSummary>,
+    pub state_digest_progression: StateDigestProgression,
     pub checksum: u64,
     pub snapshot_present: bool,
     pub snapshot_source_tick: Option<Tick>,
     pub snapshot_capture_checksum: Option<u64>,
 }
 
+pub type ReplayTickSummary = TickLifecycleSummary;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayInspectionView {
     pub record_count: usize,
     pub final_tick: Tick,
-    pub tick_summaries: Vec<ReplayTickSummary>,
+    pub tick_summaries: Vec<TickLifecycleSummary>,
 }
 
 pub fn inspect_replay_trace<C, Snapshot>(
@@ -201,11 +226,16 @@ where
 {
     let tick_summaries = records
         .iter()
-        .map(|record| ReplayTickSummary {
+        .map(|record| TickLifecycleSummary {
             tick: record.tick,
             input_tick: record.input.tick,
             tick_seed: record.tick_seed,
             phase_markers: record.phase_markers.clone(),
+            validation_summaries: record.validation_summaries.clone(),
+            state_digest_progression: StateDigestProgression {
+                tick: record.tick,
+                checkpoints: record.validation_summaries.clone(),
+            },
             checksum: record.checksum,
             snapshot_present: record.snapshot.is_some(),
             snapshot_source_tick: record
@@ -251,6 +281,10 @@ where
     PhaseMarkers {
         expected: Vec<PhaseMarker>,
         actual: Vec<PhaseMarker>,
+    },
+    ValidationSummaries {
+        expected: Vec<ValidationSummary>,
+        actual: Vec<ValidationSummary>,
     },
     Checksum {
         expected: u64,
@@ -322,6 +356,13 @@ where
                 write!(
                     f,
                     "phase marker mismatch at index {}: expected {:?}, got {:?}",
+                    self.record_index, expected, actual
+                )
+            }
+            ReplayMismatchKind::ValidationSummaries { expected, actual } => {
+                write!(
+                    f,
+                    "validation summary mismatch at index {}: expected {:?}, got {:?}",
                     self.record_index, expected, actual
                 )
             }
@@ -446,6 +487,17 @@ where
                 kind: ReplayMismatchKind::PhaseMarkers {
                     expected: expected_record.phase_markers.clone(),
                     actual: actual_record.phase_markers.clone(),
+                },
+            });
+        }
+
+        if expected_record.validation_summaries != actual_record.validation_summaries {
+            return Err(ReplayDivergence {
+                record_index: index,
+                tick,
+                kind: ReplayMismatchKind::ValidationSummaries {
+                    expected: expected_record.validation_summaries.clone(),
+                    actual: actual_record.validation_summaries.clone(),
                 },
             });
         }

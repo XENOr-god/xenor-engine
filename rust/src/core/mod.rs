@@ -27,6 +27,18 @@ pub enum EngineError {
         expected: u32,
         got: u32,
     },
+    ConfigDecode {
+        detail: String,
+    },
+    ConfigMismatch {
+        detail: String,
+    },
+    ScenarioDecode {
+        detail: String,
+    },
+    ScenarioMismatch {
+        detail: String,
+    },
     ReplayDecode {
         detail: String,
     },
@@ -53,6 +65,11 @@ pub enum EngineError {
     },
     CorruptedArtifact {
         artifact: &'static str,
+        detail: String,
+    },
+    InvariantViolation {
+        tick: Tick,
+        checkpoint: &'static str,
         detail: String,
     },
     ReplayMismatch {
@@ -90,6 +107,10 @@ impl fmt::Display for EngineError {
                 f,
                 "unsupported {artifact} schema version: expected {expected}, got {got}"
             ),
+            Self::ConfigDecode { detail } => write!(f, "config decode failed: {detail}"),
+            Self::ConfigMismatch { detail } => write!(f, "config mismatch: {detail}"),
+            Self::ScenarioDecode { detail } => write!(f, "scenario decode failed: {detail}"),
+            Self::ScenarioMismatch { detail } => write!(f, "scenario mismatch: {detail}"),
             Self::ReplayDecode { detail } => write!(f, "replay decode failed: {detail}"),
             Self::SnapshotDecode { detail } => write!(f, "snapshot decode failed: {detail}"),
             Self::SnapshotSerialization { tick, reason } => {
@@ -110,6 +131,14 @@ impl fmt::Display for EngineError {
             Self::CorruptedArtifact { artifact, detail } => {
                 write!(f, "corrupted {artifact} artifact: {detail}")
             }
+            Self::InvariantViolation {
+                tick,
+                checkpoint,
+                detail,
+            } => write!(
+                f,
+                "state invariant violated at tick {tick} during `{checkpoint}`: {detail}"
+            ),
             Self::ReplayMismatch { tick, detail } => match tick {
                 Some(tick) => write!(f, "replay mismatch at tick {tick}: {detail}"),
                 None => write!(f, "replay mismatch: {detail}"),

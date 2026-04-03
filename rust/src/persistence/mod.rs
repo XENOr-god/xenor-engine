@@ -5,6 +5,7 @@ use crate::canonical::{
     CANONICAL_TEXT_ENCODING, CanonicalError, CanonicalLineReader, CanonicalLineWriter,
     canonical_digest, decode_hex, decode_hex_string, encode_hex,
 };
+use crate::config::ConfigIdentity;
 use crate::core::{EngineError, Seed, Tick, tick_seed};
 use crate::engine::{ReplayableEngine, SnapshotPolicy};
 use crate::input::{Command, InputFrame};
@@ -15,9 +16,10 @@ use crate::replay::{
 use crate::scheduler::PhaseGroup;
 use crate::serialization::Serializer;
 use crate::state::SimulationState;
+use crate::validation::{ValidationCheckpoint, ValidationSummary};
 
-pub const REPLAY_ARTIFACT_SCHEMA_VERSION: u32 = 1;
-pub const SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub const REPLAY_ARTIFACT_SCHEMA_VERSION: u32 = 2;
+pub const SNAPSHOT_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayArtifactMetadata {
@@ -26,6 +28,7 @@ pub struct ReplayArtifactMetadata {
     pub base_seed: Seed,
     pub total_ticks: Tick,
     pub snapshot_policy: SnapshotPolicy,
+    pub config_identity: ConfigIdentity,
     pub command_payload_schema_version: u32,
     pub snapshot_payload_schema_version: u32,
     pub record_count: usize,
@@ -46,6 +49,7 @@ pub struct SnapshotArtifactMetadata {
     pub artifact_schema_version: u32,
     pub engine_family: String,
     pub base_seed: Seed,
+    pub config_identity: ConfigIdentity,
     pub capture_reason: SnapshotCaptureReason,
     pub snapshot: SnapshotMetadata,
 }
@@ -65,28 +69,36 @@ pub struct ArtifactSummary {
     pub base_seed: Seed,
     pub final_tick: Tick,
     pub final_checksum: u64,
+    pub config_payload_schema_version: u32,
+    pub config_digest: u64,
     pub replay_artifact_schema_version: u32,
     pub snapshot_artifact_schema_version: u32,
     pub command_payload_schema_version: u32,
     pub snapshot_payload_schema_version: u32,
     pub replay_digest: u64,
     pub snapshot_digest: Option<u64>,
+    pub scenario_digest: Option<u64>,
 }
 
 impl ArtifactSummary {
     pub fn to_text(&self) -> String {
         format!(
-            "engine_family={}\nbase_seed={}\nfinal_tick={}\nfinal_checksum={}\nreplay_artifact_schema_version={}\nsnapshot_artifact_schema_version={}\ncommand_payload_schema_version={}\nsnapshot_payload_schema_version={}\nreplay_digest={}\nsnapshot_digest={}\n",
+            "engine_family={}\nbase_seed={}\nfinal_tick={}\nfinal_checksum={}\nconfig_payload_schema_version={}\nconfig_digest={}\nreplay_artifact_schema_version={}\nsnapshot_artifact_schema_version={}\ncommand_payload_schema_version={}\nsnapshot_payload_schema_version={}\nreplay_digest={}\nsnapshot_digest={}\nscenario_digest={}\n",
             self.engine_family,
             self.base_seed,
             self.final_tick,
             self.final_checksum,
+            self.config_payload_schema_version,
+            self.config_digest,
             self.replay_artifact_schema_version,
             self.snapshot_artifact_schema_version,
             self.command_payload_schema_version,
             self.snapshot_payload_schema_version,
             self.replay_digest,
             self.snapshot_digest
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".into()),
+            self.scenario_digest
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "none".into())
         )
@@ -141,6 +153,7 @@ impl<Snapshot, PayloadSerializer> SnapshotArtifactSerializer<Snapshot, PayloadSe
     pub fn build_artifact(
         &self,
         base_seed: Seed,
+        config_identity: ConfigIdentity,
         record: &SnapshotRecord<Snapshot>,
     ) -> SnapshotArtifact<Snapshot>
     where
@@ -151,6 +164,7 @@ impl<Snapshot, PayloadSerializer> SnapshotArtifactSerializer<Snapshot, PayloadSe
                 artifact_schema_version: SNAPSHOT_ARTIFACT_SCHEMA_VERSION,
                 engine_family: self.engine_family.clone(),
                 base_seed,
+                config_identity,
                 capture_reason: record.reason.clone(),
                 snapshot: record.metadata,
             },
@@ -257,6 +271,7 @@ where
         &self,
         base_seed: Seed,
         snapshot_policy: SnapshotPolicy,
+        config_identity: ConfigIdentity,
         records: &[ReplayTickRecord<C, Snapshot>],
     ) -> Result<ReplayArtifact<C, Snapshot>, EngineError> {
         validate_record_sequence(
@@ -273,6 +288,7 @@ where
                 base_seed,
                 total_ticks: records.last().map(|record| record.tick).unwrap_or(0),
                 snapshot_policy,
+                config_identity,
                 command_payload_schema_version: self.command_serializer.schema_version(),
                 snapshot_payload_schema_version: self.snapshot_serializer.schema_version(),
                 record_count: records.len(),
@@ -284,6 +300,7 @@ where
     pub fn build_snapshot_artifact(
         &self,
         base_seed: Seed,
+        config_identity: ConfigIdentity,
         record: &SnapshotRecord<Snapshot>,
     ) -> SnapshotArtifact<Snapshot> {
         SnapshotArtifact {
@@ -291,6 +308,7 @@ where
                 artifact_schema_version: SNAPSHOT_ARTIFACT_SCHEMA_VERSION,
                 engine_family: self.engine_family.clone(),
                 base_seed,
+                config_identity,
                 capture_reason: record.reason.clone(),
                 snapshot: record.metadata,
             },
@@ -318,7 +336,13 @@ where
             .iter()
             .rev()
             .find_map(|record| record.snapshot.as_ref())
-            .map(|record| self.build_snapshot_artifact(artifact.metadata.base_seed, record))
+            .map(|record| {
+                self.build_snapshot_artifact(
+                    artifact.metadata.base_seed,
+                    artifact.metadata.config_identity,
+                    record,
+                )
+            })
             .map(|artifact| {
                 encode_snapshot_artifact_bytes(
                     &self.engine_family,
@@ -335,12 +359,15 @@ where
             base_seed: artifact.metadata.base_seed,
             final_tick,
             final_checksum,
+            config_payload_schema_version: artifact.metadata.config_identity.payload_schema_version,
+            config_digest: artifact.metadata.config_identity.digest,
             replay_artifact_schema_version: artifact.metadata.artifact_schema_version,
             snapshot_artifact_schema_version: SNAPSHOT_ARTIFACT_SCHEMA_VERSION,
             command_payload_schema_version: artifact.metadata.command_payload_schema_version,
             snapshot_payload_schema_version: artifact.metadata.snapshot_payload_schema_version,
             replay_digest,
             snapshot_digest,
+            scenario_digest: None,
         })
     }
 
@@ -430,6 +457,11 @@ where
             encode_snapshot_policy(value.metadata.snapshot_policy),
         );
         writer.push_display(
+            "config_payload_schema_version",
+            value.metadata.config_identity.payload_schema_version,
+        );
+        writer.push_display("config_digest", value.metadata.config_identity.digest);
+        writer.push_display(
             "command_payload_schema_version",
             value.metadata.command_payload_schema_version,
         );
@@ -477,6 +509,25 @@ where
                 writer.push_str_hex(
                     format!("record.{index}.phase.{phase_index}.name_hex").as_str(),
                     &marker.name,
+                );
+            }
+
+            writer.push_display(
+                format!("record.{index}.validation_count").as_str(),
+                record.validation_summaries.len(),
+            );
+            for (validation_index, validation) in record.validation_summaries.iter().enumerate() {
+                writer.push_display(
+                    format!("record.{index}.validation.{validation_index}.checkpoint").as_str(),
+                    validation.checkpoint.as_str(),
+                );
+                writer.push_display(
+                    format!("record.{index}.validation.{validation_index}.state_tick").as_str(),
+                    validation.state_tick,
+                );
+                writer.push_display(
+                    format!("record.{index}.validation.{validation_index}.state_digest").as_str(),
+                    validation.state_digest,
                 );
             }
 
@@ -566,6 +617,16 @@ where
         )?;
         let snapshot_policy =
             parse_snapshot_policy(read_replay_value(&mut reader, "snapshot_policy")?)?;
+        let config_payload_schema_version = parse_u32(
+            read_replay_value(&mut reader, "config_payload_schema_version")?,
+            "replay",
+            "config payload schema version",
+        )?;
+        let config_digest = parse_u64(
+            read_replay_value(&mut reader, "config_digest")?,
+            "replay",
+            "config digest",
+        )?;
         let command_payload_schema_version = parse_u32(
             read_replay_value(&mut reader, "command_payload_schema_version")?,
             "replay",
@@ -664,6 +725,51 @@ where
                 });
             }
 
+            let validation_count = parse_usize(
+                read_replay_value(
+                    &mut reader,
+                    format!("record.{index}.validation_count").as_str(),
+                )?,
+                "replay",
+                "validation count",
+            )?;
+            let mut validation_summaries = Vec::with_capacity(validation_count);
+
+            for validation_index in 0..validation_count {
+                let checkpoint = ValidationCheckpoint::parse(read_replay_value(
+                    &mut reader,
+                    format!("record.{index}.validation.{validation_index}.checkpoint").as_str(),
+                )?)
+                .ok_or_else(|| EngineError::CorruptedArtifact {
+                    artifact: "replay",
+                    detail: format!(
+                        "invalid validation checkpoint at record {index}, validation {validation_index}"
+                    ),
+                })?;
+                let state_tick = parse_u64(
+                    read_replay_value(
+                        &mut reader,
+                        format!("record.{index}.validation.{validation_index}.state_tick").as_str(),
+                    )?,
+                    "replay",
+                    "validation state tick",
+                )?;
+                let state_digest = parse_u64(
+                    read_replay_value(
+                        &mut reader,
+                        format!("record.{index}.validation.{validation_index}.state_digest")
+                            .as_str(),
+                    )?,
+                    "replay",
+                    "validation state digest",
+                )?;
+                validation_summaries.push(ValidationSummary {
+                    checkpoint,
+                    state_tick,
+                    state_digest,
+                });
+            }
+
             let checksum = parse_u64(
                 read_replay_value(&mut reader, format!("record.{index}.checksum").as_str())?,
                 "replay",
@@ -736,6 +842,7 @@ where
                 input: InputFrame::new(input_tick, command),
                 tick_seed: tick_seed_value,
                 phase_markers,
+                validation_summaries,
                 checksum,
                 snapshot,
             });
@@ -752,6 +859,10 @@ where
                 base_seed,
                 total_ticks,
                 snapshot_policy,
+                config_identity: ConfigIdentity {
+                    payload_schema_version: config_payload_schema_version,
+                    digest: config_digest,
+                },
                 command_payload_schema_version,
                 snapshot_payload_schema_version,
                 record_count,
@@ -767,6 +878,7 @@ where
 pub fn validate_snapshot_artifact<S>(
     artifact: &SnapshotArtifact<S::Snapshot>,
     expected_seed: Seed,
+    expected_config_identity: ConfigIdentity,
 ) -> Result<(), EngineError>
 where
     S: SimulationState,
@@ -775,6 +887,15 @@ where
         return Err(EngineError::SeedMismatch {
             expected: expected_seed,
             got: artifact.metadata.base_seed,
+        });
+    }
+
+    if artifact.metadata.config_identity != expected_config_identity {
+        return Err(EngineError::ConfigMismatch {
+            detail: format!(
+                "snapshot config identity mismatch: expected {:?}, got {:?}",
+                expected_config_identity, artifact.metadata.config_identity
+            ),
         });
     }
 
@@ -812,6 +933,7 @@ where
 pub fn record_replay<C, S, E, Build, CommandSerializer, SnapshotSerializer>(
     base_seed: Seed,
     snapshot_policy: SnapshotPolicy,
+    config_identity: ConfigIdentity,
     frames: &[InputFrame<C>],
     build: Build,
     serializer: &ReplayArtifactSerializer<C, S::Snapshot, CommandSerializer, SnapshotSerializer>,
@@ -838,8 +960,12 @@ where
         engine.tick(frame.clone())?;
     }
 
-    let artifact =
-        serializer.build_artifact(base_seed, snapshot_policy, engine.replay_records())?;
+    let artifact = serializer.build_artifact(
+        base_seed,
+        snapshot_policy,
+        config_identity,
+        engine.replay_records(),
+    )?;
     let summary = serializer.summary(&artifact)?;
     let final_tick = artifact.metadata.total_ticks;
     let final_checksum = artifact
@@ -852,7 +978,7 @@ where
         .iter()
         .rev()
         .find_map(|record| record.snapshot.as_ref())
-        .map(|record| serializer.build_snapshot_artifact(base_seed, record));
+        .map(|record| serializer.build_snapshot_artifact(base_seed, config_identity, record));
 
     Ok(RecordedReplay {
         artifact,
@@ -868,6 +994,7 @@ where
 
 pub fn execute_replay_verify<C, S, E, Build, CommandSerializer, SnapshotSerializer>(
     artifact: &ReplayArtifact<C, S::Snapshot>,
+    expected_config_identity: ConfigIdentity,
     build: Build,
     serializer: &ReplayArtifactSerializer<C, S::Snapshot, CommandSerializer, SnapshotSerializer>,
 ) -> Result<ReplayExecutionResult<S::Snapshot>, EngineError>
@@ -882,6 +1009,7 @@ where
     SnapshotSerializer::Error: fmt::Display,
 {
     validate_replay_artifact_for_state::<C, S>(artifact)?;
+    validate_replay_config_identity(artifact.metadata.config_identity, expected_config_identity)?;
 
     let mut engine = build(
         artifact.metadata.base_seed,
@@ -915,7 +1043,13 @@ where
         .iter()
         .rev()
         .find_map(|record| record.snapshot.as_ref())
-        .map(|record| serializer.build_snapshot_artifact(artifact.metadata.base_seed, record));
+        .map(|record| {
+            serializer.build_snapshot_artifact(
+                artifact.metadata.base_seed,
+                artifact.metadata.config_identity,
+                record,
+            )
+        });
 
     Ok(ReplayExecutionResult {
         mode: ReplayExecutionMode::ReplayVerify,
@@ -929,6 +1063,7 @@ where
 pub fn execute_replay_from_snapshot<C, S, E, Build, CommandSerializer, SnapshotSerializer>(
     snapshot: &SnapshotArtifact<S::Snapshot>,
     artifact: &ReplayArtifact<C, S::Snapshot>,
+    expected_config_identity: ConfigIdentity,
     build: Build,
     serializer: &ReplayArtifactSerializer<C, S::Snapshot, CommandSerializer, SnapshotSerializer>,
 ) -> Result<ReplayExecutionResult<S::Snapshot>, EngineError>
@@ -951,7 +1086,12 @@ where
         });
     }
 
-    validate_snapshot_artifact::<S>(snapshot, artifact.metadata.base_seed)?;
+    validate_replay_config_identity(artifact.metadata.config_identity, expected_config_identity)?;
+    validate_snapshot_artifact::<S>(
+        snapshot,
+        artifact.metadata.base_seed,
+        expected_config_identity,
+    )?;
 
     let source_tick = snapshot.metadata.snapshot.source_tick;
     let source_index = artifact
@@ -1038,7 +1178,13 @@ where
         .iter()
         .rev()
         .find_map(|record| record.snapshot.as_ref())
-        .map(|record| serializer.build_snapshot_artifact(artifact.metadata.base_seed, record))
+        .map(|record| {
+            serializer.build_snapshot_artifact(
+                artifact.metadata.base_seed,
+                artifact.metadata.config_identity,
+                record,
+            )
+        })
         .or_else(|| Some(snapshot.clone()));
 
     Ok(ReplayExecutionResult {
@@ -1180,6 +1326,8 @@ where
                 ),
             });
         }
+
+        validate_validation_summaries(record)?;
 
         match (&snapshot_policy, &record.snapshot) {
             (SnapshotPolicy::Never, Some(_)) => {
@@ -1329,6 +1477,11 @@ where
     writer.push_str_hex("engine_family_hex", &value.metadata.engine_family);
     writer.push_display("base_seed", value.metadata.base_seed);
     writer.push_display(
+        "config_payload_schema_version",
+        value.metadata.config_identity.payload_schema_version,
+    );
+    writer.push_display("config_digest", value.metadata.config_identity.digest);
+    writer.push_display(
         "capture_reason",
         encode_snapshot_capture_reason(&value.metadata.capture_reason),
     );
@@ -1340,6 +1493,69 @@ where
     writer.push_display("capture_checksum", value.metadata.snapshot.capture_checksum);
     writer.push_display("payload_hex", encode_hex(&payload));
     Ok(writer.finish())
+}
+
+fn validate_validation_summaries<C, Snapshot>(
+    record: &ReplayTickRecord<C, Snapshot>,
+) -> Result<(), EngineError>
+where
+    C: Command,
+    Snapshot: Clone + Eq + fmt::Debug,
+{
+    let mut last_order = None;
+    let expected_state_tick = record.tick.saturating_sub(1);
+
+    for summary in &record.validation_summaries {
+        let order = match summary.checkpoint {
+            ValidationCheckpoint::BeforeTickBegin => 0usize,
+            ValidationCheckpoint::AfterInputApplied => 1usize,
+            ValidationCheckpoint::AfterSimulationGroup => 2usize,
+            ValidationCheckpoint::AfterFinalize => 3usize,
+        };
+
+        if let Some(previous) = last_order
+            && order <= previous
+        {
+            return Err(EngineError::CorruptedArtifact {
+                artifact: "replay",
+                detail: format!(
+                    "validation checkpoint order mismatch at tick {}: got `{}` after previous checkpoint",
+                    record.tick,
+                    summary.checkpoint.as_str()
+                ),
+            });
+        }
+
+        if summary.state_tick != expected_state_tick {
+            return Err(EngineError::CorruptedArtifact {
+                artifact: "replay",
+                detail: format!(
+                    "validation state tick mismatch at replay tick {}: expected {}, got {}",
+                    record.tick, expected_state_tick, summary.state_tick
+                ),
+            });
+        }
+
+        last_order = Some(order);
+    }
+
+    Ok(())
+}
+
+fn validate_replay_config_identity(
+    actual: ConfigIdentity,
+    expected: ConfigIdentity,
+) -> Result<(), EngineError> {
+    if actual != expected {
+        return Err(EngineError::ConfigMismatch {
+            detail: format!(
+                "replay config identity mismatch: expected {:?}, got {:?}",
+                expected, actual
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn decode_snapshot_artifact_bytes<Snapshot, PayloadSerializer>(
@@ -1389,6 +1605,16 @@ where
         "snapshot",
         "base seed",
     )?;
+    let config_payload_schema_version = parse_u32(
+        read_snapshot_value(&mut reader, "config_payload_schema_version")?,
+        "snapshot",
+        "config payload schema version",
+    )?;
+    let config_digest = parse_u64(
+        read_snapshot_value(&mut reader, "config_digest")?,
+        "snapshot",
+        "config digest",
+    )?;
     let capture_reason =
         parse_snapshot_capture_reason(read_snapshot_value(&mut reader, "capture_reason")?)?;
     let payload_schema_version = parse_u32(
@@ -1433,6 +1659,10 @@ where
             artifact_schema_version: decoded_artifact_schema_version,
             engine_family: decoded_engine_family,
             base_seed,
+            config_identity: ConfigIdentity {
+                payload_schema_version: config_payload_schema_version,
+                digest: config_digest,
+            },
             capture_reason,
             snapshot: SnapshotMetadata {
                 payload_schema_version,
@@ -1445,36 +1675,14 @@ where
 }
 
 fn encode_snapshot_policy(policy: SnapshotPolicy) -> String {
-    match policy {
-        SnapshotPolicy::Never => "never".into(),
-        SnapshotPolicy::Every { interval } => format!("every:{interval}"),
-        SnapshotPolicy::Manual => "manual".into(),
-    }
+    policy.canonical_string()
 }
 
 fn parse_snapshot_policy(value: &str) -> Result<SnapshotPolicy, EngineError> {
-    match value {
-        "never" => Ok(SnapshotPolicy::Never),
-        "manual" => Ok(SnapshotPolicy::Manual),
-        _ => {
-            let (kind, raw_interval) =
-                value
-                    .split_once(':')
-                    .ok_or_else(|| EngineError::CorruptedArtifact {
-                        artifact: "replay",
-                        detail: format!("invalid snapshot policy `{value}`"),
-                    })?;
-            if kind != "every" {
-                return Err(EngineError::CorruptedArtifact {
-                    artifact: "replay",
-                    detail: format!("invalid snapshot policy `{value}`"),
-                });
-            }
-            Ok(SnapshotPolicy::Every {
-                interval: parse_u64(raw_interval, "replay", "snapshot policy interval")?,
-            })
-        }
-    }
+    SnapshotPolicy::parse(value).ok_or_else(|| EngineError::CorruptedArtifact {
+        artifact: "replay",
+        detail: format!("invalid snapshot policy `{value}`"),
+    })
 }
 
 fn encode_snapshot_capture_reason(reason: &SnapshotCaptureReason) -> String {
