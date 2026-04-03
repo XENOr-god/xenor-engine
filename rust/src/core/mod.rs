@@ -39,6 +39,9 @@ pub enum EngineError {
     ScenarioMismatch {
         detail: String,
     },
+    SummaryMismatch {
+        detail: String,
+    },
     ReplayDecode {
         detail: String,
     },
@@ -111,6 +114,7 @@ impl fmt::Display for EngineError {
             Self::ConfigMismatch { detail } => write!(f, "config mismatch: {detail}"),
             Self::ScenarioDecode { detail } => write!(f, "scenario decode failed: {detail}"),
             Self::ScenarioMismatch { detail } => write!(f, "scenario mismatch: {detail}"),
+            Self::SummaryMismatch { detail } => write!(f, "summary mismatch: {detail}"),
             Self::ReplayDecode { detail } => write!(f, "replay decode failed: {detail}"),
             Self::SnapshotDecode { detail } => write!(f, "snapshot decode failed: {detail}"),
             Self::SnapshotSerialization { tick, reason } => {

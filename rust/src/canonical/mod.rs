@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::core::checksum_bytes;
@@ -48,7 +48,7 @@ impl CanonicalLineWriter {
 pub struct CanonicalLineReader<'a> {
     lines: Vec<(&'a str, &'a str)>,
     index: usize,
-    consumed_keys: HashSet<&'a str>,
+    consumed_keys: BTreeSet<&'a str>,
 }
 
 impl<'a> CanonicalLineReader<'a> {
@@ -105,7 +105,7 @@ impl<'a> CanonicalLineReader<'a> {
         Ok(Self {
             lines,
             index: 0,
-            consumed_keys: HashSet::new(),
+            consumed_keys: BTreeSet::new(),
         })
     }
 

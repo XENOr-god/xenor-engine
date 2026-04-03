@@ -6,8 +6,10 @@ use crate::canonical::{
     canonical_digest, decode_hex, decode_hex_string, encode_hex,
 };
 use crate::core::EngineError;
+use crate::deterministic::DeterministicList;
 use crate::engine::SnapshotPolicy;
 use crate::serialization::Serializer;
+use crate::state::CounterEntityInit;
 use crate::validation::ValidationPolicy;
 
 pub const CONFIG_ARTIFACT_SCHEMA_VERSION: u32 = 1;
@@ -38,6 +40,7 @@ where
 pub struct CounterSimulationConfig {
     pub initial_value: i64,
     pub initial_velocity: i64,
+    pub initial_entities: DeterministicList<CounterEntityInit>,
     pub snapshot_policy: SnapshotPolicy,
     pub validation_policy: ValidationPolicy,
     pub max_abs_value: i64,
@@ -78,6 +81,38 @@ impl CounterSimulationConfig {
             });
         }
 
+        self.validate_entity_value("initial_value", self.initial_value)?;
+        self.validate_entity_value("initial_velocity", self.initial_velocity)?;
+
+        for (index, entity) in self.initial_entities.iter().enumerate() {
+            self.validate_entity_value(
+                format!("initial_entities[{index}].value").as_str(),
+                entity.value,
+            )?;
+            self.validate_entity_value(
+                format!("initial_entities[{index}].velocity").as_str(),
+                entity.velocity,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn validate_entity_value(&self, label: &str, value: i64) -> Result<(), EngineError> {
+        let limit = if label.ends_with("velocity") {
+            self.max_abs_velocity
+        } else {
+            self.max_abs_value
+        };
+        let magnitude = i128::from(value).abs();
+        if magnitude > i128::from(limit) {
+            return Err(EngineError::ConfigMismatch {
+                detail: format!(
+                    "{label} exceeds deterministic limit: value={value}, limit={limit}"
+                ),
+            });
+        }
+
         Ok(())
     }
 }
@@ -93,6 +128,7 @@ impl Default for CounterSimulationConfig {
         Self {
             initial_value: 0,
             initial_velocity: 0,
+            initial_entities: DeterministicList::new(),
             snapshot_policy: SnapshotPolicy::Every { interval: 1 },
             validation_policy: ValidationPolicy::TickBoundary,
             max_abs_value: i64::MAX,

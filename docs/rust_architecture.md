@@ -32,6 +32,9 @@ The engine is best treated as a deterministic execution kernel composed of:
 - `config`
   Typed simulation configuration, canonical config artifacts, and config
   identity digests that remain separate from replay input and runtime state.
+- `deterministic`
+  Ordered collection wrappers that keep authoritative state and canonical
+  contracts independent from hash randomization.
 - `state`
   Authoritative simulation state and snapshot projection contract.
 - `input`
@@ -80,6 +83,9 @@ The engine is best treated as a deterministic execution kernel composed of:
   Systems mutate only through the provided context. Hidden state is forbidden.
 - `scheduler`
   Ordering is visible and stable.
+- `deterministic`
+  Authoritative collection lookup and iteration stay stable under domain
+  growth.
 - `replay`
   Logging is append-only and derived from explicit engine events.
 - `serialization`
@@ -99,6 +105,7 @@ rust/
     lib.rs
     core/
     config/
+    deterministic/
     state/
     input/
     rng/
@@ -122,8 +129,12 @@ rust/
   Seed/tick/checksum helpers, deterministic errors, shared scalar types.
 - `config`
   `ConfigArtifact`, config identity digesting, and typed runtime/init contract.
+- `deterministic`
+  `DeterministicMap` and `DeterministicList` wrappers for ordered lookup and
+  stable iteration.
 - `state`
-  `SimulationState` contract and canonical snapshot boundary inside the Rust
+  `SimulationState` contract, deterministic entity container, transient
+  per-tick data boundary, and canonical snapshot boundary inside the Rust
   architecture.
 - `input`
   `Command` trait and `InputFrame`.
@@ -155,7 +166,8 @@ rust/
 - `scenario`
   Versioned scenario artifacts, scenario execution, and scenario verification.
 - `api`
-  Stable consumer-facing entry points and sample engine construction.
+  Stable consumer-facing entry points, DTO-like interop bundles, and sample
+  engine construction.
 - `bindings`
   Leaf wrappers for FFI, WASM, or host-specific integration.
 
@@ -163,7 +175,7 @@ rust/
 
 - `core`
   Depends on nothing else.
-- `config`, `input`, `state`, `rng`
+- `config`, `deterministic`, `input`, `state`, `rng`
   May depend on `core` only.
 - `validation`
   May depend on `core` and `state`.
@@ -173,7 +185,8 @@ rust/
   May depend on `core`, `config`, `input`, `state`, `replay`, `engine`, and
   `serialization`.
 - `serialization`
-  May depend on `core`, `config`, `state`, `input`, and `validation`.
+  May depend on `core`, `config`, `deterministic`, `state`, `input`, and
+  `validation`.
 - `phases`
   May depend on `core`, `input`, `state`, `rng`, `replay`.
 - `scheduler`
@@ -194,6 +207,35 @@ Rules:
 - inner layers never depend on `api` or `bindings`
 - `bindings` never reach into concrete engine internals directly
 - `engine` owns orchestration, not policy hidden in adapters
+
+## Deterministic Collections + State Growth
+
+The authoritative path now treats ordered collections as part of the engine
+contract, not an implementation detail.
+
+- `DeterministicMap<K, V>`
+  Ordered map wrapper for deterministic lookup and iteration.
+- `DeterministicList<T>`
+  Stable insertion-order list wrapper for authoritative ordering contracts.
+
+Rules:
+
+- authoritative state must not depend on `HashMap` / `HashSet` iteration
+- canonical artifact identity must derive from stable field order and stable
+  collection order
+- entity containers must preserve insertion order and deterministic lookup
+- transient per-tick data must stay separate from authoritative snapshot data
+
+The sample counter state now models that growth discipline with:
+
+- stable `EntityId`
+- deterministic entity storage
+- explicit `primary_entity`
+- explicit `next_entity_id`
+- transient pending fields stored separately from authoritative entity payload
+
+This is not a full ECS. It is a narrow preparation step so domain growth can
+add more state without reopening determinism fundamentals.
 
 ## Core Abstractions
 
@@ -301,6 +343,21 @@ trait Serializer<T> {
 14. Engine finalizes the replay tick record with checksum, validation summaries,
     phase markers, and optional snapshot payload plus snapshot metadata
     `(payload_schema_version, source_tick, capture_checksum)`.
+
+### State Mutation Rule
+
+State mutation is intentionally narrow:
+
+- authoritative state mutates only during phase execution
+- phases receive mutable access through `TickContext`, not through leaked host
+  references
+- host-facing helpers may inspect state, snapshots, artifacts, and summaries,
+  but they do not own mutation authority
+- state validation runs at explicit checkpoints so invalid transitions fail at
+  deterministic boundaries
+
+This keeps future native/WASM bindings from accidentally introducing mutation
+paths that bypass replay, validation, or snapshot discipline.
 
 ### Main Loop Pseudocode
 
@@ -484,6 +541,28 @@ The current Rust implementation hardens that text encoding with:
 - canonical digest generation from exported bytes for replay, snapshot, and
   fixture parity checks
 
+### Final Artifact Contract
+
+The current foundation treats these contracts as fixed compatibility boundaries:
+
+- config artifact
+  typed initialization contract and config identity digest
+- scenario artifact
+  `config artifact + base seed + ordered frames + optional expected parity`
+- replay artifact
+  append-only recorded ticks plus config identity and schema metadata
+- snapshot artifact
+  authoritative state checkpoint plus config identity and payload schema
+- golden fixture bundle
+  config artifact, optional scenario artifact, replay artifact, optional
+  snapshot artifact, and versioned summary
+- parity summary
+  config schema/digest, base seed, final tick, final checksum, replay digest,
+  optional snapshot digest, and optional scenario digest
+
+All of them must satisfy `export -> import -> export` identity and fail fast on
+any ambiguity or cross-artifact inconsistency.
+
 ### Versioning Constraint
 
 Replay validity across versions is only possible when:
@@ -514,7 +593,7 @@ The Rust baseline now treats golden fixtures as a first-class library surface.
   digest.
 - `GoldenFixtureResult`
   Verification report containing summary comparison plus separated config,
-  replay, and snapshot mismatch details.
+  scenario, replay, snapshot, and summary mismatch details.
 - `SimulationScenario`
   Versioned scenario contract over config artifact, seed, ordered frames, and
   optional expected parity summary.
@@ -530,6 +609,20 @@ This is deliberately library-level only. There is no large file-I/O layer here.
 The goal is to make parity fixtures deterministic, inspectable, and easy to
 assert in tests before any external Rust/C++ integration is attempted.
 
+### Scenario + Fixture Flow
+
+The intended deterministic flow is now:
+
+1. build typed config
+2. optionally build a versioned scenario over config + seed + ordered frames
+3. execute the scenario to obtain replay, optional snapshot, summaries, and
+   parity summary
+4. bundle those artifacts into a canonical golden fixture
+5. import the fixture and rerun verification from the embedded config/scenario
+   contract
+6. fail with categorized mismatch reporting if config, scenario, replay,
+   snapshot, or summary contracts diverge
+
 ## Determinism Rules
 
 - no system time
@@ -538,6 +631,7 @@ assert in tests before any external Rust/C++ integration is attempted.
 - no global mutable singletons
 - no ambient randomness
 - no unordered iteration where order affects behavior
+- no hash-randomized authoritative collections
 - no floating-point nondeterminism in authoritative state unless the strategy is
   explicitly controlled
 - all input must be explicit and ordered
@@ -545,6 +639,25 @@ assert in tests before any external Rust/C++ integration is attempted.
 - all external side effects must sit outside authoritative state evolution
 - snapshots and checksums must derive from semantic state, not object layout
 - scheduler order must be explicit and stable
+
+## Interop API Contract
+
+The Rust `api` module is now shaped as the host-facing contract for
+`xenor-native` and future `xenor-site` / WASM integration.
+
+It exposes thin, deterministic operations for:
+
+- building typed sample config
+- importing/exporting config artifacts
+- building/importing/exporting scenarios
+- executing and verifying scenarios
+- generating/importing/exporting/verifying golden fixtures
+- importing/exporting replay and snapshot artifacts
+- obtaining artifact summaries, replay inspection views, and parity summaries
+- exporting DTO-like interop bundles that contain canonical artifact bytes,
+  digests, and summaries without leaking scheduler or phase internals
+
+Bindings should consume this layer, not internal engine modules.
 
 ## Risks + Mitigation
 
@@ -614,6 +727,7 @@ The repository now includes an isolated Rust core under `rust/` with:
 
 - explicit module boundaries matching this document
 - typed simulation config artifacts with canonical identity digests
+- deterministic collection wrappers for authoritative entity/state growth
 - a deterministic tick pipeline with strict ordered-input validation
 - grouped fixed scheduler inspection through `PhaseDescriptor` and `PhaseGroup`
 - append-only replay tick records with phase markers, validation summaries, and
@@ -628,9 +742,13 @@ The repository now includes an isolated Rust core under `rust/` with:
   including config identity
 - replay inspection views for deterministic mismatch debugging
 - explicit invariant validation policy at tick boundaries or every phase group
+- phase-scoped state mutation through `TickContext` and crate-owned mutation
+  methods
 - fast-forward replay verification from compatible snapshot checkpoints
 - one example state type and command pipeline that makes phase ordering observable
 - one deterministic serializer example
+- interop-ready DTO bundles for config/scenario/replay/snapshot/fixture export
+  and digest exchange across native or web boundaries
 - regression tests for replay equality, canonical re-export, schema version
   gating, config/scenario roundtrips, golden fixture verification,
   snapshot-backed resume, replay inspection, invariant enforcement, scenario

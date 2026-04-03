@@ -5,6 +5,7 @@ pub mod bindings;
 mod canonical;
 pub mod config;
 pub mod core;
+pub mod deterministic;
 pub mod engine;
 pub mod fixture;
 pub mod input;
@@ -20,27 +21,31 @@ pub mod state;
 pub mod validation;
 
 pub use api::{
-    COUNTER_ENGINE_FAMILY, CounterCommand, CounterConfig, CounterConfigArtifact,
-    CounterConfigArtifactCodec, CounterEngine, CounterGoldenFixture, CounterGoldenFixtureCodec,
-    CounterGoldenFixtureResult, CounterParitySummary, CounterRecordedReplay, CounterReplayArtifact,
+    COUNTER_ENGINE_FAMILY, CounterArtifactDigests, CounterCommand, CounterConfig,
+    CounterConfigArtifact, CounterConfigArtifactCodec, CounterEngine, CounterFixtureInteropBundle,
+    CounterGoldenFixture, CounterGoldenFixtureCodec, CounterGoldenFixtureResult,
+    CounterInteropArtifacts, CounterParitySummary, CounterRecordedReplay, CounterReplayArtifact,
     CounterReplayArtifactCodec, CounterReplayLog, CounterReplayResult, CounterScenario,
-    CounterScenarioCodec, CounterScenarioExecutionResult, CounterScenarioVerificationResult,
-    CounterScheduler, CounterSnapshotArtifact, CounterSnapshotArtifactCodec, CounterStateValidator,
-    EngineApi, build_counter_config_artifact, build_counter_scenario,
-    counter_config_artifact_codec, counter_config_with_policy, counter_engine_with_config,
-    counter_engine_with_policy, counter_golden_fixture_codec, counter_parity_summary,
-    counter_replay_artifact_codec, counter_replay_summary, counter_scenario_codec,
-    counter_snapshot_artifact_at_tick, counter_snapshot_artifact_codec,
+    CounterScenarioCodec, CounterScenarioExecutionResult, CounterScenarioInteropBundle,
+    CounterScenarioVerificationResult, CounterScheduler, CounterSnapshotArtifact,
+    CounterSnapshotArtifactCodec, CounterStateValidator, EngineApi, build_counter_config_artifact,
+    build_counter_scenario, counter_config_artifact_codec, counter_config_artifact_digest,
+    counter_config_with_policy, counter_engine_with_config, counter_engine_with_policy,
+    counter_golden_fixture_codec, counter_golden_fixture_digest, counter_parity_summary,
+    counter_replay_artifact_codec, counter_replay_artifact_digest, counter_replay_summary,
+    counter_scenario_codec, counter_scenario_digest, counter_snapshot_artifact_at_tick,
+    counter_snapshot_artifact_codec, counter_snapshot_artifact_digest,
     counter_snapshot_artifact_from_engine, default_counter_config, execute_counter_scenario,
-    export_counter_config_artifact, export_counter_golden_fixture, export_counter_replay_artifact,
-    export_counter_scenario, export_counter_snapshot_artifact, generate_counter_golden_fixture,
-    generate_counter_golden_fixture_from_scenario, generate_counter_golden_fixture_with_config,
-    import_counter_config_artifact, import_counter_golden_fixture, import_counter_replay_artifact,
-    import_counter_scenario, import_counter_snapshot_artifact, inspect_counter_replay,
-    minimal_counter_engine, record_counter_replay, record_counter_replay_with_config,
-    resume_counter_replay_from_snapshot, resume_counter_replay_from_snapshot_with_config,
-    verify_counter_golden_fixture, verify_counter_replay, verify_counter_replay_with_config,
-    verify_counter_scenario,
+    execute_counter_scenario_interop_bundle, export_counter_config_artifact,
+    export_counter_fixture_interop_bundle, export_counter_golden_fixture,
+    export_counter_replay_artifact, export_counter_scenario, export_counter_snapshot_artifact,
+    generate_counter_golden_fixture, generate_counter_golden_fixture_from_scenario,
+    generate_counter_golden_fixture_with_config, import_counter_config_artifact,
+    import_counter_golden_fixture, import_counter_replay_artifact, import_counter_scenario,
+    import_counter_snapshot_artifact, inspect_counter_replay, minimal_counter_engine,
+    record_counter_replay, record_counter_replay_with_config, resume_counter_replay_from_snapshot,
+    resume_counter_replay_from_snapshot_with_config, verify_counter_golden_fixture,
+    verify_counter_replay, verify_counter_replay_with_config, verify_counter_scenario,
 };
 pub use bindings::EngineBinding;
 pub use config::{
@@ -48,6 +53,7 @@ pub use config::{
     ConfigArtifactSerializer, ConfigIdentity, CounterSimulationConfig, SimulationConfig,
 };
 pub use core::{EngineError, Seed, Tick};
+pub use deterministic::{DeterministicList, DeterministicMap};
 pub use engine::{DeterministicEngine, Engine, ReplayableEngine, SnapshotPolicy, TickResult};
 pub use fixture::{
     GOLDEN_FIXTURE_SCHEMA_VERSION, GoldenFixture, GoldenFixtureMetadata, GoldenFixtureResult,
@@ -81,7 +87,10 @@ pub use serialization::{
     CounterCommandTextSerializer, CounterConfigTextSerializer, CounterSnapshotTextSerializer,
     SerializationError, Serializer,
 };
-pub use state::{CounterSnapshot, CounterState, SimulationState};
+pub use state::{
+    CounterEntityInit, CounterEntitySnapshot, CounterSnapshot, CounterState, EntityId,
+    SimulationState,
+};
 pub use validation::{
     NoopStateValidator, StateDigestProgression, StateValidator, ValidationCheckpoint,
     ValidationContext, ValidationPolicy, ValidationSummary,
@@ -92,15 +101,17 @@ mod tests {
     use crate::api::{
         CounterCommand, build_counter_config_artifact, build_counter_engine,
         build_counter_scenario, counter_golden_fixture_codec, counter_parity_summary,
-        counter_replay_artifact_codec, counter_replay_summary, default_counter_config,
-        default_counter_scheduler, execute_counter_scenario, export_counter_config_artifact,
-        export_counter_golden_fixture, export_counter_replay_artifact, export_counter_scenario,
-        export_counter_snapshot_artifact, generate_counter_golden_fixture,
-        generate_counter_golden_fixture_from_scenario, generate_counter_golden_fixture_with_config,
-        import_counter_config_artifact, import_counter_golden_fixture,
-        import_counter_replay_artifact, import_counter_scenario, import_counter_snapshot_artifact,
-        inspect_counter_replay, minimal_counter_engine, record_counter_replay,
-        record_counter_replay_with_config, reordered_counter_scheduler,
+        counter_replay_artifact_codec, counter_replay_artifact_digest, counter_replay_summary,
+        counter_scenario_digest, counter_snapshot_artifact_digest, default_counter_config,
+        default_counter_scheduler, execute_counter_scenario,
+        execute_counter_scenario_interop_bundle, export_counter_config_artifact,
+        export_counter_fixture_interop_bundle, export_counter_golden_fixture,
+        export_counter_replay_artifact, export_counter_scenario, export_counter_snapshot_artifact,
+        generate_counter_golden_fixture, generate_counter_golden_fixture_from_scenario,
+        generate_counter_golden_fixture_with_config, import_counter_config_artifact,
+        import_counter_golden_fixture, import_counter_replay_artifact, import_counter_scenario,
+        import_counter_snapshot_artifact, inspect_counter_replay, minimal_counter_engine,
+        record_counter_replay, record_counter_replay_with_config, reordered_counter_scheduler,
         resume_counter_replay_from_snapshot, verify_counter_golden_fixture, verify_counter_replay,
         verify_counter_replay_with_config, verify_counter_scenario,
     };
@@ -109,9 +120,10 @@ mod tests {
     use crate::input::InputFrame;
     use crate::parity::{ParityArtifactSummary, ParityMismatch, compare_parity_summaries};
     use crate::replay::{ReplayLog, ReplayMismatchKind, compare_replay_traces};
+    use crate::rng::{Rng, SplitMix64};
     use crate::scheduler::{PhaseGroup, Scheduler};
     use crate::serialization::{CounterSnapshotTextSerializer, Serializer};
-    use crate::state::SimulationState;
+    use crate::state::{CounterEntityInit, CounterState, EntityId, SimulationState};
     use crate::validation::{ValidationCheckpoint, ValidationPolicy};
 
     fn sample_frames() -> Vec<InputFrame<CounterCommand>> {
@@ -160,6 +172,37 @@ mod tests {
             snapshot_policy,
             ..default_counter_config()
         }
+    }
+
+    fn entity_config(
+        snapshot_policy: SnapshotPolicy,
+        extra_entities: &[(i64, i64)],
+    ) -> crate::api::CounterConfig {
+        let mut config = sample_config(snapshot_policy);
+        config.initial_entities = extra_entities
+            .iter()
+            .map(|(value, velocity)| CounterEntityInit {
+                value: *value,
+                velocity: *velocity,
+            })
+            .collect();
+        config
+    }
+
+    fn seeded_frames(seed: u64, count: usize) -> Vec<InputFrame<CounterCommand>> {
+        let mut rng = SplitMix64::from_seed(seed);
+        (1..=count)
+            .map(|tick| {
+                InputFrame::new(
+                    tick as u64,
+                    CounterCommand {
+                        delta: i64::try_from((rng.next_u64() % 11) as i64 - 5)
+                            .expect("bounded delta should fit i64"),
+                        consume_entropy: rng.next_u64() & 1 == 0,
+                    },
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -570,7 +613,7 @@ mod tests {
             .expect("snapshot artifact should serialize");
         let text = String::from_utf8(bytes).expect("artifact bytes should be utf8");
         let tampered = text.replace(
-            "snapshot_payload_schema_version=1",
+            "snapshot_payload_schema_version=2",
             "snapshot_payload_schema_version=9",
         );
 
@@ -581,7 +624,7 @@ mod tests {
             error,
             EngineError::UnsupportedSchemaVersion {
                 artifact: "snapshot payload",
-                expected: 1,
+                expected: 2,
                 got: 9
             }
         );
@@ -732,7 +775,7 @@ mod tests {
 
         assert_eq!(
             summary.to_text(),
-            "engine_family=xenor-engine-rust/counter\nbase_seed=52\nfinal_tick=4\nfinal_checksum=9273508064903698236\nconfig_payload_schema_version=1\nconfig_digest=11800967143714553337\nreplay_artifact_schema_version=2\nsnapshot_artifact_schema_version=2\ncommand_payload_schema_version=1\nsnapshot_payload_schema_version=1\nreplay_digest=18254089987914109239\nsnapshot_digest=9349583698508051315\nscenario_digest=none\n"
+            "engine_family=xenor-engine-rust/counter\nbase_seed=52\nfinal_tick=4\nfinal_checksum=5099580070206651932\nconfig_payload_schema_version=2\nconfig_digest=5311596323007274562\nreplay_artifact_schema_version=2\nsnapshot_artifact_schema_version=2\ncommand_payload_schema_version=1\nsnapshot_payload_schema_version=2\nreplay_digest=993437642736629535\nsnapshot_digest=7556615425519769554\nscenario_digest=none\n"
         );
     }
 
@@ -873,6 +916,9 @@ mod tests {
             .as_mut()
             .expect("fixture should carry a snapshot artifact")
             .payload
+            .entities
+            .get_mut(0)
+            .expect("primary entity should exist in snapshot")
             .value += 1;
 
         let result =
@@ -1008,6 +1054,279 @@ mod tests {
         let imported = codec.decode(&bytes).expect("fixture import should succeed");
 
         assert_eq!(fixture, imported);
+    }
+
+    #[test]
+    fn counter_state_entity_insertion_order_is_stable() {
+        let state = CounterState::with_initial_entities(
+            5,
+            1,
+            &vec![
+                CounterEntityInit {
+                    value: 11,
+                    velocity: 2,
+                },
+                CounterEntityInit {
+                    value: -3,
+                    velocity: -1,
+                },
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        assert_eq!(
+            state.entity_ids().collect::<Vec<_>>(),
+            vec![EntityId(1), EntityId(2), EntityId(3)]
+        );
+        assert_eq!(
+            state
+                .entity_snapshots()
+                .iter()
+                .map(|entity| entity.value)
+                .collect::<Vec<_>>(),
+            vec![5, 11, -3]
+        );
+    }
+
+    #[test]
+    fn snapshot_with_entities_roundtrips_deterministically() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 2 }, &[(4, 1), (-8, 3)]);
+        let recorded = record_counter_replay_with_config(&config, 182, &sample_frames())
+            .expect("recording should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+
+        let bytes = export_counter_snapshot_artifact(&snapshot)
+            .expect("snapshot artifact should serialize");
+        let imported =
+            import_counter_snapshot_artifact(&bytes).expect("snapshot artifact should deserialize");
+
+        assert_eq!(snapshot, imported);
+        assert_eq!(imported.payload.entities.len(), 3);
+    }
+
+    #[test]
+    fn replay_with_entities_remains_identical_across_runs() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 2 }, &[(7, 2), (9, -1)]);
+        let first = record_counter_replay_with_config(&config, 183, &sample_frames())
+            .expect("first recording should succeed");
+        let second = record_counter_replay_with_config(&config, 183, &sample_frames())
+            .expect("second recording should succeed");
+
+        assert_eq!(first.artifact, second.artifact);
+        assert_eq!(first.result.summary, second.result.summary);
+    }
+
+    #[test]
+    fn fixture_from_scenario_reports_scenario_category_when_replay_contract_is_tampered() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 2 }, &[(1, 1)]);
+        let scenario = build_counter_scenario(&config, 184, &sample_frames(), None)
+            .expect("scenario should build");
+        let mut fixture = generate_counter_golden_fixture_from_scenario(&scenario)
+            .expect("fixture generation from scenario should succeed");
+        fixture.replay_artifact.records[1].input.command.delta += 1;
+
+        let result =
+            verify_counter_golden_fixture(&fixture).expect("fixture verification should run");
+
+        assert!(!result.passed());
+        assert!(result.scenario_mismatch.is_some());
+        assert!(
+            result
+                .scenario_mismatch
+                .as_deref()
+                .expect("scenario mismatch should exist")
+                .contains("scenario frames mismatch")
+        );
+    }
+
+    #[test]
+    fn fixture_verification_reports_summary_category() {
+        let fixture = generate_counter_golden_fixture(
+            185,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        let mut tampered = fixture.clone();
+        tampered.summary.replay_digest ^= 1;
+
+        let result =
+            verify_counter_golden_fixture(&tampered).expect("fixture verification should run");
+
+        assert!(!result.passed());
+        assert!(result.summary_mismatch.is_some());
+        assert!(
+            result
+                .summary_mismatch
+                .as_deref()
+                .expect("summary mismatch should exist")
+                .contains("replay digest mismatch")
+        );
+    }
+
+    #[test]
+    fn interop_scenario_bundle_exports_consistent_bytes_and_digests() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 2 }, &[(6, 0), (2, 1)]);
+        let scenario = build_counter_scenario(&config, 186, &sample_frames(), None)
+            .expect("scenario should build");
+        let bundle = execute_counter_scenario_interop_bundle(&scenario)
+            .expect("interop scenario bundle should execute");
+
+        let replay = import_counter_replay_artifact(&bundle.artifacts.replay_artifact)
+            .expect("replay artifact should import");
+        let snapshot = bundle
+            .artifacts
+            .snapshot_artifact
+            .as_ref()
+            .map(|bytes| import_counter_snapshot_artifact(bytes))
+            .transpose()
+            .expect("snapshot artifact should import");
+
+        assert_eq!(
+            bundle.digests.replay_artifact,
+            counter_replay_artifact_digest(&replay).expect("replay digest should compute")
+        );
+        assert_eq!(
+            bundle.digests.snapshot_artifact,
+            snapshot
+                .as_ref()
+                .map(counter_snapshot_artifact_digest)
+                .transpose()
+                .expect("snapshot digest should compute")
+        );
+        assert_eq!(
+            bundle.digests.scenario_artifact,
+            Some(counter_scenario_digest(&scenario).expect("scenario digest should compute"))
+        );
+    }
+
+    #[test]
+    fn interop_fixture_bundle_exports_consistent_bytes_and_digests() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 2 }, &[(3, 2)]);
+        let scenario = build_counter_scenario(&config, 187, &sample_frames(), None)
+            .expect("scenario should build");
+        let fixture = generate_counter_golden_fixture_from_scenario(&scenario)
+            .expect("fixture should generate");
+        let bundle =
+            export_counter_fixture_interop_bundle(&fixture).expect("fixture bundle should export");
+        let imported = import_counter_golden_fixture(
+            bundle
+                .artifacts
+                .golden_fixture
+                .as_ref()
+                .expect("fixture bytes should exist"),
+        )
+        .expect("fixture should import");
+
+        assert_eq!(fixture, imported);
+        assert_eq!(
+            bundle.digests.replay_artifact,
+            counter_replay_artifact_digest(&fixture.replay_artifact)
+                .expect("replay digest should compute")
+        );
+        assert_eq!(
+            bundle.digests.scenario_artifact,
+            fixture
+                .scenario_artifact
+                .as_ref()
+                .map(counter_scenario_digest)
+                .transpose()
+                .expect("scenario digest should compute")
+        );
+    }
+
+    #[test]
+    fn long_scenario_replay_is_identical_across_runs() {
+        let config = entity_config(
+            SnapshotPolicy::Every { interval: 16 },
+            &[(12, 1), (-4, 0), (7, -2)],
+        );
+        let frames = seeded_frames(404, 128);
+        let first = record_counter_replay_with_config(&config, 188, &frames)
+            .expect("first long replay should succeed");
+        let second = record_counter_replay_with_config(&config, 188, &frames)
+            .expect("second long replay should succeed");
+
+        assert_eq!(first.artifact, second.artifact);
+        compare_replay_traces(
+            first.artifact.records.as_slice(),
+            second.artifact.records.as_slice(),
+        )
+        .expect("long deterministic traces should match");
+    }
+
+    #[test]
+    fn resume_from_mid_snapshot_matches_long_full_run() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 10 }, &[(1, 0), (2, 1)]);
+        let frames = seeded_frames(505, 120);
+        let recorded = record_counter_replay_with_config(&config, 189, &frames)
+            .expect("recording should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 100)
+            .expect("snapshot at tick 100 should exist");
+
+        let full = verify_counter_replay_with_config(&config, &recorded.artifact)
+            .expect("full replay verification should succeed");
+        let resumed = crate::api::resume_counter_replay_from_snapshot_with_config(
+            &config,
+            &snapshot,
+            &recorded.artifact,
+        )
+        .expect("resume verification should succeed");
+
+        assert_eq!(full.final_tick, resumed.final_tick);
+        assert_eq!(full.final_checksum, resumed.final_checksum);
+        assert_eq!(full.summary, resumed.summary);
+    }
+
+    #[test]
+    fn seeded_random_input_replay_is_deterministic() {
+        let config = entity_config(SnapshotPolicy::Never, &[(8, 1)]);
+        let frames = seeded_frames(606, 64);
+        let first = record_counter_replay_with_config(&config, 190, &frames)
+            .expect("first replay should succeed");
+        let second = record_counter_replay_with_config(&config, 190, &frames)
+            .expect("second replay should succeed");
+
+        assert_eq!(
+            counter_replay_artifact_digest(&first.artifact).expect("digest should compute"),
+            counter_replay_artifact_digest(&second.artifact).expect("digest should compute")
+        );
+    }
+
+    #[test]
+    fn multiple_identical_runs_keep_same_replay_digest() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 8 }, &[(5, 0), (9, 2)]);
+        let frames = seeded_frames(707, 96);
+        let baseline = record_counter_replay_with_config(&config, 191, &frames)
+            .expect("baseline replay should succeed");
+        let expected_digest =
+            counter_replay_artifact_digest(&baseline.artifact).expect("digest should compute");
+
+        for _ in 0..5 {
+            let recorded = record_counter_replay_with_config(&config, 191, &frames)
+                .expect("loop replay should succeed");
+            assert_eq!(
+                counter_replay_artifact_digest(&recorded.artifact).expect("digest should compute"),
+                expected_digest
+            );
+        }
+    }
+
+    #[test]
+    fn parity_summary_stays_stable_for_entity_config_across_runs() {
+        let config = entity_config(SnapshotPolicy::Every { interval: 4 }, &[(10, 1), (-2, -1)]);
+        let frames = seeded_frames(808, 48);
+        let first = record_counter_replay_with_config(&config, 192, &frames)
+            .expect("first replay should succeed");
+        let second = record_counter_replay_with_config(&config, 192, &frames)
+            .expect("second replay should succeed");
+
+        assert_eq!(
+            counter_parity_summary(&first.artifact).expect("first parity summary should work"),
+            counter_parity_summary(&second.artifact).expect("second parity summary should work")
+        );
     }
 
     #[test]
@@ -1182,7 +1501,7 @@ mod tests {
             export_counter_config_artifact(&artifact).expect("config artifact should serialize");
         let text = String::from_utf8(bytes).expect("config bytes should be utf8");
         let tampered = text.replace(
-            "config_payload_schema_version=1",
+            "config_payload_schema_version=2",
             "config_payload_schema_version=9",
         );
 
@@ -1193,7 +1512,7 @@ mod tests {
             error,
             EngineError::UnsupportedSchemaVersion {
                 artifact: "config payload",
-                expected: 1,
+                expected: 2,
                 got: 9,
             }
         );

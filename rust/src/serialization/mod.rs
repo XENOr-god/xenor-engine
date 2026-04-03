@@ -4,8 +4,9 @@ use std::fmt;
 use crate::api::CounterCommand;
 use crate::canonical::{CANONICAL_TEXT_ENCODING, CanonicalLineReader, CanonicalLineWriter};
 use crate::config::CounterSimulationConfig;
+use crate::deterministic::DeterministicList;
 use crate::engine::SnapshotPolicy;
-use crate::state::CounterSnapshot;
+use crate::state::{CounterEntityInit, CounterEntitySnapshot, CounterSnapshot, EntityId};
 use crate::validation::ValidationPolicy;
 
 pub trait Serializer<T> {
@@ -101,17 +102,25 @@ impl Serializer<CounterSnapshot> for CounterSnapshotTextSerializer {
     type Error = SerializationError;
 
     fn schema_version(&self) -> u32 {
-        1
+        2
     }
 
     fn encode(&self, value: &CounterSnapshot) -> Result<Vec<u8>, Self::Error> {
+        value.validate().map_err(SerializationError)?;
+
         let mut writer = CanonicalLineWriter::default();
         writer.push_display("payload_kind", "counter_snapshot");
         writer.push_display("canonical_encoding", CANONICAL_TEXT_ENCODING);
         writer.push_display("snapshot_payload_schema_version", self.schema_version());
         writer.push_display("tick", value.tick);
-        writer.push_display("value", value.value);
-        writer.push_display("velocity", value.velocity);
+        writer.push_display("next_entity_id", value.next_entity_id);
+        writer.push_display("primary_entity_id", value.primary_entity.0);
+        writer.push_display("entity_count", value.entities.len());
+        for (index, entity) in value.entities.iter().enumerate() {
+            writer.push_display(format!("entity.{index}.id").as_str(), entity.id.0);
+            writer.push_display(format!("entity.{index}.value").as_str(), entity.value);
+            writer.push_display(format!("entity.{index}.velocity").as_str(), entity.velocity);
+        }
         writer.push_display("pending_delta", value.pending_delta);
         writer.push_display("pending_entropy", value.pending_entropy);
         writer.push_display("entropy_budget", value.entropy_budget);
@@ -156,16 +165,50 @@ impl Serializer<CounterSnapshot> for CounterSnapshotTextSerializer {
                 .read_value("tick", "counter snapshot payload")
                 .map_err(|error| SerializationError(error.to_string()))?,
         )?;
-        let value = parse_i64(
+        let next_entity_id = parse_u64(
             reader
-                .read_value("value", "counter snapshot payload")
+                .read_value("next_entity_id", "counter snapshot payload")
                 .map_err(|error| SerializationError(error.to_string()))?,
         )?;
-        let velocity = parse_i64(
+        let primary_entity = EntityId(parse_u64(
             reader
-                .read_value("velocity", "counter snapshot payload")
+                .read_value("primary_entity_id", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?);
+        let entity_count = parse_usize(
+            reader
+                .read_value("entity_count", "counter snapshot payload")
                 .map_err(|error| SerializationError(error.to_string()))?,
         )?;
+        let mut entities = DeterministicList::new();
+        for index in 0..entity_count {
+            entities.push(CounterEntitySnapshot {
+                id: EntityId(parse_u64(
+                    reader
+                        .read_value(
+                            format!("entity.{index}.id").as_str(),
+                            "counter snapshot payload",
+                        )
+                        .map_err(|error| SerializationError(error.to_string()))?,
+                )?),
+                value: parse_i64(
+                    reader
+                        .read_value(
+                            format!("entity.{index}.value").as_str(),
+                            "counter snapshot payload",
+                        )
+                        .map_err(|error| SerializationError(error.to_string()))?,
+                )?,
+                velocity: parse_i64(
+                    reader
+                        .read_value(
+                            format!("entity.{index}.velocity").as_str(),
+                            "counter snapshot payload",
+                        )
+                        .map_err(|error| SerializationError(error.to_string()))?,
+                )?,
+            });
+        }
         let pending_delta = parse_i64(
             reader
                 .read_value("pending_delta", "counter snapshot payload")
@@ -191,15 +234,19 @@ impl Serializer<CounterSnapshot> for CounterSnapshotTextSerializer {
             .finish("counter snapshot payload")
             .map_err(|error| SerializationError(error.to_string()))?;
 
-        Ok(CounterSnapshot {
+        let snapshot = CounterSnapshot {
             tick,
-            value,
-            velocity,
+            next_entity_id,
+            primary_entity,
+            entities,
             pending_delta,
             pending_entropy,
             entropy_budget,
             finalize_marker,
-        })
+        };
+        snapshot.validate().map_err(SerializationError)?;
+
+        Ok(snapshot)
     }
 }
 
@@ -210,7 +257,7 @@ impl Serializer<CounterSimulationConfig> for CounterConfigTextSerializer {
     type Error = SerializationError;
 
     fn schema_version(&self) -> u32 {
-        1
+        2
     }
 
     fn encode(&self, value: &CounterSimulationConfig) -> Result<Vec<u8>, Self::Error> {
@@ -224,6 +271,17 @@ impl Serializer<CounterSimulationConfig> for CounterConfigTextSerializer {
         writer.push_display("config_payload_schema_version", self.schema_version());
         writer.push_display("initial_value", value.initial_value);
         writer.push_display("initial_velocity", value.initial_velocity);
+        writer.push_display("initial_entity_count", value.initial_entities.len());
+        for (index, entity) in value.initial_entities.iter().enumerate() {
+            writer.push_display(
+                format!("initial_entity.{index}.value").as_str(),
+                entity.value,
+            );
+            writer.push_display(
+                format!("initial_entity.{index}.velocity").as_str(),
+                entity.velocity,
+            );
+        }
         writer.push_display("snapshot_policy", value.snapshot_policy.canonical_string());
         writer.push_display("validation_policy", value.validation_policy.as_str());
         writer.push_display("max_abs_value", value.max_abs_value);
@@ -268,6 +326,35 @@ impl Serializer<CounterSimulationConfig> for CounterConfigTextSerializer {
                     .read_value("initial_velocity", "counter config payload")
                     .map_err(|error| SerializationError(error.to_string()))?,
             )?,
+            initial_entities: {
+                let entity_count = parse_usize(
+                    reader
+                        .read_value("initial_entity_count", "counter config payload")
+                        .map_err(|error| SerializationError(error.to_string()))?,
+                )?;
+                let mut entities = DeterministicList::new();
+                for index in 0..entity_count {
+                    entities.push(CounterEntityInit {
+                        value: parse_i64(
+                            reader
+                                .read_value(
+                                    format!("initial_entity.{index}.value").as_str(),
+                                    "counter config payload",
+                                )
+                                .map_err(|error| SerializationError(error.to_string()))?,
+                        )?,
+                        velocity: parse_i64(
+                            reader
+                                .read_value(
+                                    format!("initial_entity.{index}.velocity").as_str(),
+                                    "counter config payload",
+                                )
+                                .map_err(|error| SerializationError(error.to_string()))?,
+                        )?,
+                    });
+                }
+                entities
+            },
             snapshot_policy: parse_snapshot_policy(
                 reader
                     .read_value("snapshot_policy", "counter config payload")
@@ -329,6 +416,12 @@ fn parse_u64(value: &str) -> Result<u64, SerializationError> {
     value
         .parse()
         .map_err(|error| SerializationError(format!("invalid u64 `{value}`: {error}")))
+}
+
+fn parse_usize(value: &str) -> Result<usize, SerializationError> {
+    value
+        .parse()
+        .map_err(|error| SerializationError(format!("invalid usize `{value}`: {error}")))
 }
 
 fn parse_i64(value: &str) -> Result<i64, SerializationError> {

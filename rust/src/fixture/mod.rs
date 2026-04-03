@@ -1,8 +1,8 @@
 use std::fmt;
 
 use crate::canonical::{
-    CANONICAL_TEXT_ENCODING, CanonicalLineReader, CanonicalLineWriter, decode_hex,
-    decode_hex_string, encode_hex,
+    CANONICAL_TEXT_ENCODING, CanonicalLineReader, CanonicalLineWriter, canonical_digest,
+    decode_hex, decode_hex_string, encode_hex,
 };
 use crate::config::{ConfigArtifact, ConfigArtifactSerializer, SimulationConfig};
 use crate::core::{EngineError, Seed, Tick};
@@ -103,15 +103,19 @@ pub struct GoldenFixtureResult {
     pub actual_summary: ParityArtifactSummary,
     pub comparison: ParityComparison,
     pub config_mismatch: Option<String>,
+    pub scenario_mismatch: Option<String>,
     pub replay_mismatch: Option<String>,
     pub snapshot_mismatch: Option<String>,
+    pub summary_mismatch: Option<String>,
 }
 
 impl GoldenFixtureResult {
     pub fn passed(&self) -> bool {
         self.config_mismatch.is_none()
+            && self.scenario_mismatch.is_none()
             && self.replay_mismatch.is_none()
             && self.snapshot_mismatch.is_none()
+            && self.summary_mismatch.is_none()
             && self.comparison.is_match()
     }
 }
@@ -263,6 +267,10 @@ where
         )
     }
 
+    pub fn digest(&self, fixture: &GoldenFixture<C, Snapshot, Config>) -> Result<u64, EngineError> {
+        self.encode(fixture).map(|bytes| canonical_digest(&bytes))
+    }
+
     pub fn encode(
         &self,
         fixture: &GoldenFixture<C, Snapshot, Config>,
@@ -273,6 +281,26 @@ where
                 expected: GOLDEN_FIXTURE_SCHEMA_VERSION,
                 got: fixture.metadata.artifact_schema_version,
             });
+        }
+
+        validate_fixture_contract(
+            &fixture.config_artifact,
+            fixture.scenario_artifact.as_ref(),
+            &fixture.replay_artifact,
+            fixture.snapshot_artifact.as_ref(),
+        )?;
+        if let Some(detail) = compare_fixture_scenario_contract(fixture, &fixture.config_artifact)?
+        {
+            return Err(EngineError::ScenarioMismatch { detail });
+        }
+        let expected_summary = self.fixture_summary_from_artifacts(
+            &fixture.replay_artifact,
+            fixture.snapshot_artifact.as_ref(),
+            fixture.scenario_artifact.as_ref(),
+        )?;
+        if let Some(detail) = compare_fixture_summary_contract(&fixture.summary, &expected_summary)
+        {
+            return Err(EngineError::SummaryMismatch { detail });
         }
 
         let config_bytes = self
@@ -378,7 +406,7 @@ where
             .finish("golden fixture")
             .map_err(golden_fixture_corrupted)?;
 
-        Ok(GoldenFixture {
+        let fixture = GoldenFixture {
             metadata: GoldenFixtureMetadata {
                 artifact_schema_version,
             },
@@ -387,7 +415,29 @@ where
             replay_artifact,
             snapshot_artifact,
             summary,
-        })
+        };
+
+        validate_fixture_contract(
+            &fixture.config_artifact,
+            fixture.scenario_artifact.as_ref(),
+            &fixture.replay_artifact,
+            fixture.snapshot_artifact.as_ref(),
+        )?;
+        if let Some(detail) = compare_fixture_scenario_contract(&fixture, &fixture.config_artifact)?
+        {
+            return Err(EngineError::ScenarioMismatch { detail });
+        }
+        let expected_summary = self.fixture_summary_from_artifacts(
+            &fixture.replay_artifact,
+            fixture.snapshot_artifact.as_ref(),
+            fixture.scenario_artifact.as_ref(),
+        )?;
+        if let Some(detail) = compare_fixture_summary_contract(&fixture.summary, &expected_summary)
+        {
+            return Err(EngineError::SummaryMismatch { detail });
+        }
+
+        Ok(fixture)
     }
 
     pub fn verify_fixture<S, E, Build>(
@@ -423,6 +473,7 @@ where
 
         let config_mismatch =
             compare_fixture_config_contract(fixture, &effective_config, scenario_digest)?;
+        let scenario_mismatch = compare_fixture_scenario_contract(fixture, &effective_config)?;
 
         let config = effective_config.payload.clone();
         let recorded = record_replay::<C, S, E, _, _, _>(
@@ -440,6 +491,9 @@ where
             &ParityArtifactSummary::from(&fixture.summary),
             &actual_summary,
         );
+        let summary_mismatch = comparison
+            .first_mismatch()
+            .map(|mismatch| mismatch.to_string());
         let replay_mismatch = compare_replay_traces_with_snapshot_digest(
             fixture.replay_artifact.records.as_slice(),
             recorded.artifact.records.as_slice(),
@@ -458,8 +512,10 @@ where
             actual_summary,
             comparison,
             config_mismatch,
+            scenario_mismatch,
             replay_mismatch,
             snapshot_mismatch,
+            summary_mismatch,
         })
     }
 
@@ -613,6 +669,64 @@ where
     }
 
     Ok(None)
+}
+
+fn compare_fixture_scenario_contract<C, Snapshot, Config>(
+    fixture: &GoldenFixture<C, Snapshot, Config>,
+    effective_config: &ConfigArtifact<Config>,
+) -> Result<Option<String>, EngineError>
+where
+    C: Command,
+    Snapshot: Clone + Eq + fmt::Debug,
+    Config: Clone + Eq + fmt::Debug + SimulationConfig,
+{
+    let Some(scenario) = fixture.scenario_artifact.as_ref() else {
+        return Ok(None);
+    };
+
+    if scenario.config_artifact != *effective_config {
+        return Ok(Some(format!(
+            "scenario config artifact mismatch: expected {:?}, got {:?}",
+            effective_config, scenario.config_artifact
+        )));
+    }
+
+    if scenario.base_seed != fixture.replay_artifact.metadata.base_seed {
+        return Ok(Some(format!(
+            "scenario base seed mismatch: expected {}, got {}",
+            fixture.replay_artifact.metadata.base_seed, scenario.base_seed
+        )));
+    }
+
+    let replay_frames = fixture
+        .replay_artifact
+        .records
+        .iter()
+        .map(|record| record.input.clone())
+        .collect::<Vec<_>>();
+    if scenario.frames != replay_frames {
+        return Ok(Some(format!(
+            "scenario frames mismatch: expected {:?}, got {:?}",
+            replay_frames, scenario.frames
+        )));
+    }
+
+    Ok(None)
+}
+
+fn compare_fixture_summary_contract(
+    actual: &GoldenFixtureSummary,
+    expected: &GoldenFixtureSummary,
+) -> Option<String> {
+    let comparison = compare_parity_summaries(
+        &ParityArtifactSummary::from(expected),
+        &ParityArtifactSummary::from(actual),
+    );
+    if comparison.is_match() {
+        None
+    } else {
+        Some(comparison.to_string())
+    }
 }
 
 fn compare_optional_snapshot_artifacts<Snapshot, SnapshotSerializer>(

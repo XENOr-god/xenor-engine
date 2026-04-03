@@ -13,12 +13,12 @@ where
     R: Rng,
     L: ReplayLog<C, S::Snapshot>,
 {
-    pub base_seed: Seed,
-    pub tick_seed: Seed,
-    pub tick: Tick,
-    pub frame: &'a InputFrame<C>,
-    pub state: &'a mut S,
-    pub replay: &'a mut L,
+    base_seed: Seed,
+    tick_seed: Seed,
+    tick: Tick,
+    frame: &'a InputFrame<C>,
+    state: &'a mut S,
+    replay: &'a mut L,
     pub(crate) _marker: PhantomData<R>,
 }
 
@@ -50,6 +50,38 @@ where
 
     pub fn rng_for(&self, stream: &'static str) -> R {
         R::from_seed(fork_seed(self.tick_seed, stream))
+    }
+
+    pub const fn base_seed(&self) -> Seed {
+        self.base_seed
+    }
+
+    pub const fn tick_seed(&self) -> Seed {
+        self.tick_seed
+    }
+
+    pub const fn tick(&self) -> Tick {
+        self.tick
+    }
+
+    pub fn frame(&self) -> &'a InputFrame<C> {
+        self.frame
+    }
+
+    pub fn state(&self) -> &S {
+        self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut S {
+        self.state
+    }
+
+    pub fn replay(&self) -> &L {
+        self.replay
+    }
+
+    pub fn replay_mut(&mut self) -> &mut L {
+        self.replay
     }
 }
 

@@ -216,6 +216,12 @@ artifact-validation surface, not a replacement for the legacy C++ runtime.
   initial state, snapshot policy, validation policy, and deterministic limits
   are exported as canonical config artifacts with explicit payload schema and
   digest
+- authoritative collections use deterministic wrappers:
+  `DeterministicMap` and `DeterministicList` enforce stable lookup and stable
+  iteration so domain growth does not accidentally depend on hash
+  randomization
+- authoritative state is split from transient tick data and now carries a
+  deterministic entity container with stable entity ids and insertion order
 - replay, snapshot, and golden fixture exports use canonical text encoding with
   fixed headers, fixed field order, hex-escaped free-form strings, and fail-fast
   decode on duplicate, missing, reordered, or trailing malformed fields
@@ -236,11 +242,23 @@ artifact-validation surface, not a replacement for the legacy C++ runtime.
 - parity summaries compare config schema/digest, base seed, final tick, final
   checksum, replay digest, optional snapshot digest, and optional scenario
   digest
+- state mutation is phase-scoped:
+  authoritative state mutates only through `TickContext` during fixed pipeline
+  execution; host-facing API surfaces plain artifacts, summaries, and DTO-like
+  interop bundles instead of engine internals
+- the API surface is interop-ready for native and WASM boundaries:
+  callers can build config/scenario contracts, execute scenarios, import/export
+  config/scenario/replay/snapshot/fixture artifacts, verify them, and obtain
+  digest-oriented summaries without binding to internal scheduler or state
+  machinery
 
 ## Development Notes
 
 - Keep seeds and per-tick inputs explicit at the engine boundary.
 - Use fixed phases to make ordering visible instead of implicit.
+- Use `DeterministicMap` / `DeterministicList` for authoritative collections;
+  do not introduce hash-randomized structures into deterministic state or
+  artifact contracts.
 - Prefer the step-context RNG over ambient global randomness.
 - Keep scheduler group order explicit: `PreInput -> Input -> Simulation -> PostSimulation -> Finalize`.
 - Capture snapshots only through an explicit cadence policy; do not make them implicit side effects.
@@ -248,6 +266,8 @@ artifact-validation surface, not a replacement for the legacy C++ runtime.
 - Keep artifact schema versions distinct from config/command/snapshot payload schema versions; never guess payload contracts during decode.
 - Treat deterministic config as part of replay identity, not a convenience default hidden behind seed + inputs.
 - Keep validation checkpoints explicit in the pipeline; do not hide invariant enforcement behind ad hoc debug code.
+- Keep authoritative mutation inside phase execution through `TickContext`; do
+  not mutate state from host-facing helper layers.
 - Keep snapshot payload conversion and payload migration in adapters.
 - Do not treat `last_completed_tick` as payload-owned state.
 - Use append-only replay traces and divergence checks for inspection and regression validation, not as a persistence format.

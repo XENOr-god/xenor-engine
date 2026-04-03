@@ -1,7 +1,9 @@
 use crate::config::{ConfigArtifact, ConfigArtifactSerializer, CounterSimulationConfig};
 use crate::core::{EngineError, Seed, Tick, mix64};
 use crate::engine::{DeterministicEngine, Engine, SnapshotPolicy};
-use crate::fixture::{GoldenFixture, GoldenFixtureResult, GoldenFixtureSerializer};
+use crate::fixture::{
+    GoldenFixture, GoldenFixtureResult, GoldenFixtureSerializer, GoldenFixtureSummary,
+};
 use crate::input::{Command, InputFrame};
 use crate::parity::ParityArtifactSummary;
 use crate::persistence::{
@@ -149,6 +151,53 @@ impl CounterStateValidator {
         Ok(())
     }
 
+    fn expect_entity_store(
+        &self,
+        context: ValidationContext,
+        state: &CounterState,
+    ) -> Result<(), EngineError> {
+        if state.entity_count() == 0 {
+            return Err(
+                self.invariant_error(context, "entity store must contain at least one entity")
+            );
+        }
+
+        if state.entity_snapshot(state.primary_entity_id()).is_none() {
+            return Err(self.invariant_error(
+                context,
+                format!(
+                    "primary entity {:?} is missing from deterministic store",
+                    state.primary_entity_id()
+                ),
+            ));
+        }
+
+        let entity_ids = state.entity_ids().collect::<Vec<_>>();
+        if entity_ids.first().copied() != Some(state.primary_entity_id()) {
+            return Err(self.invariant_error(
+                context,
+                format!(
+                    "primary entity {:?} must remain first in insertion order, got {:?}",
+                    state.primary_entity_id(),
+                    entity_ids.first().copied()
+                ),
+            ));
+        }
+
+        let max_entity_id = entity_ids.iter().map(|id| id.0).max().unwrap_or(0);
+        if state.next_entity_id().0 <= max_entity_id {
+            return Err(self.invariant_error(
+                context,
+                format!(
+                    "next entity id must be greater than all assigned ids: next={}, max={max_entity_id}",
+                    state.next_entity_id().0
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn expect_marker_zero(
         &self,
         context: ValidationContext,
@@ -219,6 +268,7 @@ impl StateValidator<CounterState> for CounterStateValidator {
     ) -> Result<(), EngineError> {
         self.expect_tick_alignment(context, state)?;
         self.expect_limits(context, state)?;
+        self.expect_entity_store(context, state)?;
 
         match context.checkpoint {
             ValidationCheckpoint::BeforeTickBegin => {
@@ -291,6 +341,41 @@ pub type CounterGoldenFixtureCodec = GoldenFixtureSerializer<
 >;
 pub type CounterParitySummary = ParityArtifactSummary;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterInteropArtifacts {
+    pub config_artifact: Vec<u8>,
+    pub scenario_artifact: Option<Vec<u8>>,
+    pub replay_artifact: Vec<u8>,
+    pub snapshot_artifact: Option<Vec<u8>>,
+    pub golden_fixture: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterArtifactDigests {
+    pub config_artifact: u64,
+    pub scenario_artifact: Option<u64>,
+    pub replay_artifact: u64,
+    pub snapshot_artifact: Option<u64>,
+    pub golden_fixture: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterScenarioInteropBundle {
+    pub artifacts: CounterInteropArtifacts,
+    pub digests: CounterArtifactDigests,
+    pub summary: ArtifactSummary,
+    pub parity_summary: CounterParitySummary,
+    pub inspection: ReplayInspectionView,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CounterFixtureInteropBundle {
+    pub artifacts: CounterInteropArtifacts,
+    pub digests: CounterArtifactDigests,
+    pub summary: GoldenFixtureSummary,
+    pub parity_summary: CounterParitySummary,
+}
+
 #[derive(Default)]
 pub struct ResetFinalizeMarkerPhase;
 
@@ -305,7 +390,7 @@ impl Phase<CounterState, CounterCommand, SplitMix64, CounterReplayLog>
         &mut self,
         ctx: &mut TickContext<'_, CounterState, CounterCommand, SplitMix64, CounterReplayLog>,
     ) -> Result<(), EngineError> {
-        ctx.state.reset_finalize_marker();
+        ctx.state_mut().reset_finalize_marker();
         Ok(())
     }
 }
@@ -322,14 +407,16 @@ impl Phase<CounterState, CounterCommand, SplitMix64, CounterReplayLog> for Apply
         &mut self,
         ctx: &mut TickContext<'_, CounterState, CounterCommand, SplitMix64, CounterReplayLog>,
     ) -> Result<(), EngineError> {
-        let entropy = if ctx.frame.command.consume_entropy {
+        let delta = ctx.frame().command.delta;
+        let consume_entropy = ctx.frame().command.consume_entropy;
+        let entropy = if consume_entropy {
             let mut rng = ctx.rng_for(self.name());
             rng.next_u64() & 0xff
         } else {
             0
         };
 
-        ctx.state.stage_input(ctx.frame.command.delta, entropy);
+        ctx.state_mut().stage_input(delta, entropy);
         Ok(())
     }
 }
@@ -346,7 +433,7 @@ impl Phase<CounterState, CounterCommand, SplitMix64, CounterReplayLog> for Simul
         &mut self,
         ctx: &mut TickContext<'_, CounterState, CounterCommand, SplitMix64, CounterReplayLog>,
     ) -> Result<(), EngineError> {
-        ctx.state.simulate();
+        ctx.state_mut().simulate();
         Ok(())
     }
 }
@@ -363,7 +450,7 @@ impl Phase<CounterState, CounterCommand, SplitMix64, CounterReplayLog> for Settl
         &mut self,
         ctx: &mut TickContext<'_, CounterState, CounterCommand, SplitMix64, CounterReplayLog>,
     ) -> Result<(), EngineError> {
-        ctx.state.settle();
+        ctx.state_mut().settle();
         Ok(())
     }
 }
@@ -380,8 +467,8 @@ impl Phase<CounterState, CounterCommand, SplitMix64, CounterReplayLog> for Final
         &mut self,
         ctx: &mut TickContext<'_, CounterState, CounterCommand, SplitMix64, CounterReplayLog>,
     ) -> Result<(), EngineError> {
-        let marker = mix64(ctx.tick_seed ^ ctx.state.checksum() ^ ctx.tick);
-        ctx.state.finalize(marker);
+        let marker = mix64(ctx.tick_seed() ^ ctx.state().checksum() ^ ctx.tick());
+        ctx.state_mut().finalize(marker);
         Ok(())
     }
 }
@@ -421,7 +508,11 @@ fn build_counter_engine_internal(
 ) -> CounterEngine {
     DeterministicEngine::new(
         seed,
-        CounterState::with_initial_conditions(config.initial_value, config.initial_velocity),
+        CounterState::with_initial_entities(
+            config.initial_value,
+            config.initial_velocity,
+            &config.initial_entities,
+        ),
         scheduler,
         CounterReplayLog::default(),
     )
@@ -455,6 +546,12 @@ pub fn export_counter_config_artifact(
     artifact: &CounterConfigArtifact,
 ) -> Result<Vec<u8>, EngineError> {
     counter_config_artifact_codec().encode(artifact)
+}
+
+pub fn counter_config_artifact_digest(
+    artifact: &CounterConfigArtifact,
+) -> Result<u64, EngineError> {
+    counter_config_artifact_codec().digest(artifact)
 }
 
 pub fn import_counter_config_artifact(bytes: &[u8]) -> Result<CounterConfigArtifact, EngineError> {
@@ -540,6 +637,10 @@ pub fn import_counter_scenario(bytes: &[u8]) -> Result<CounterScenario, EngineEr
     counter_scenario_codec().decode(bytes)
 }
 
+pub fn counter_scenario_digest(scenario: &CounterScenario) -> Result<u64, EngineError> {
+    counter_scenario_codec().digest(scenario)
+}
+
 pub fn execute_counter_scenario(
     scenario: &CounterScenario,
 ) -> Result<CounterScenarioExecutionResult, EngineError> {
@@ -596,6 +697,12 @@ pub fn export_counter_replay_artifact(
     artifact: &CounterReplayArtifact,
 ) -> Result<Vec<u8>, EngineError> {
     counter_replay_artifact_codec().encode(artifact)
+}
+
+pub fn counter_replay_artifact_digest(
+    artifact: &CounterReplayArtifact,
+) -> Result<u64, EngineError> {
+    counter_replay_artifact_codec().digest(artifact)
 }
 
 pub fn import_counter_replay_artifact(bytes: &[u8]) -> Result<CounterReplayArtifact, EngineError> {
@@ -682,6 +789,12 @@ pub fn export_counter_snapshot_artifact(
     counter_snapshot_artifact_codec().encode(artifact)
 }
 
+pub fn counter_snapshot_artifact_digest(
+    artifact: &CounterSnapshotArtifact,
+) -> Result<u64, EngineError> {
+    counter_snapshot_artifact_codec().digest(artifact)
+}
+
 pub fn import_counter_snapshot_artifact(
     bytes: &[u8],
 ) -> Result<CounterSnapshotArtifact, EngineError> {
@@ -734,6 +847,10 @@ pub fn export_counter_golden_fixture(
     counter_golden_fixture_codec().encode(fixture)
 }
 
+pub fn counter_golden_fixture_digest(fixture: &CounterGoldenFixture) -> Result<u64, EngineError> {
+    counter_golden_fixture_codec().digest(fixture)
+}
+
 pub fn import_counter_golden_fixture(bytes: &[u8]) -> Result<CounterGoldenFixture, EngineError> {
     counter_golden_fixture_codec().decode(bytes)
 }
@@ -747,6 +864,78 @@ pub fn verify_counter_golden_fixture(
             build_counter_engine_internal(seed, default_counter_scheduler(), config.clone())
         },
     )
+}
+
+pub fn execute_counter_scenario_interop_bundle(
+    scenario: &CounterScenario,
+) -> Result<CounterScenarioInteropBundle, EngineError> {
+    let execution = execute_counter_scenario(scenario)?;
+    Ok(CounterScenarioInteropBundle {
+        artifacts: CounterInteropArtifacts {
+            config_artifact: export_counter_config_artifact(&scenario.config_artifact)?,
+            scenario_artifact: Some(export_counter_scenario(scenario)?),
+            replay_artifact: export_counter_replay_artifact(&execution.replay.artifact)?,
+            snapshot_artifact: execution
+                .final_snapshot
+                .as_ref()
+                .map(export_counter_snapshot_artifact)
+                .transpose()?,
+            golden_fixture: None,
+        },
+        digests: CounterArtifactDigests {
+            config_artifact: counter_config_artifact_digest(&scenario.config_artifact)?,
+            scenario_artifact: Some(counter_scenario_digest(scenario)?),
+            replay_artifact: counter_replay_artifact_digest(&execution.replay.artifact)?,
+            snapshot_artifact: execution
+                .final_snapshot
+                .as_ref()
+                .map(counter_snapshot_artifact_digest)
+                .transpose()?,
+            golden_fixture: None,
+        },
+        summary: execution.replay.result.summary.clone(),
+        parity_summary: execution.parity_summary.clone(),
+        inspection: execution.inspection,
+    })
+}
+
+pub fn export_counter_fixture_interop_bundle(
+    fixture: &CounterGoldenFixture,
+) -> Result<CounterFixtureInteropBundle, EngineError> {
+    Ok(CounterFixtureInteropBundle {
+        artifacts: CounterInteropArtifacts {
+            config_artifact: export_counter_config_artifact(&fixture.config_artifact)?,
+            scenario_artifact: fixture
+                .scenario_artifact
+                .as_ref()
+                .map(export_counter_scenario)
+                .transpose()?,
+            replay_artifact: export_counter_replay_artifact(&fixture.replay_artifact)?,
+            snapshot_artifact: fixture
+                .snapshot_artifact
+                .as_ref()
+                .map(export_counter_snapshot_artifact)
+                .transpose()?,
+            golden_fixture: Some(export_counter_golden_fixture(fixture)?),
+        },
+        digests: CounterArtifactDigests {
+            config_artifact: counter_config_artifact_digest(&fixture.config_artifact)?,
+            scenario_artifact: fixture
+                .scenario_artifact
+                .as_ref()
+                .map(counter_scenario_digest)
+                .transpose()?,
+            replay_artifact: counter_replay_artifact_digest(&fixture.replay_artifact)?,
+            snapshot_artifact: fixture
+                .snapshot_artifact
+                .as_ref()
+                .map(counter_snapshot_artifact_digest)
+                .transpose()?,
+            golden_fixture: Some(counter_golden_fixture_digest(fixture)?),
+        },
+        summary: fixture.summary.clone(),
+        parity_summary: CounterParitySummary::from(&fixture.summary),
+    })
 }
 
 pub fn resume_counter_replay_from_snapshot_with_config(
