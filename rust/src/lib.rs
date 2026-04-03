@@ -17,6 +17,7 @@ pub mod rng;
 pub mod scenario;
 pub mod scheduler;
 pub mod serialization;
+pub mod settlement;
 pub mod state;
 pub mod validation;
 
@@ -28,24 +29,51 @@ pub use api::{
     CounterReplayArtifactCodec, CounterReplayLog, CounterReplayResult, CounterScenario,
     CounterScenarioCodec, CounterScenarioExecutionResult, CounterScenarioInteropBundle,
     CounterScenarioVerificationResult, CounterScheduler, CounterSnapshotArtifact,
-    CounterSnapshotArtifactCodec, CounterStateValidator, EngineApi, build_counter_config_artifact,
-    build_counter_scenario, counter_config_artifact_codec, counter_config_artifact_digest,
-    counter_config_with_policy, counter_engine_with_config, counter_engine_with_policy,
-    counter_golden_fixture_codec, counter_golden_fixture_digest, counter_parity_summary,
-    counter_replay_artifact_codec, counter_replay_artifact_digest, counter_replay_summary,
-    counter_scenario_codec, counter_scenario_digest, counter_snapshot_artifact_at_tick,
-    counter_snapshot_artifact_codec, counter_snapshot_artifact_digest,
-    counter_snapshot_artifact_from_engine, default_counter_config, execute_counter_scenario,
-    execute_counter_scenario_interop_bundle, export_counter_config_artifact,
+    CounterSnapshotArtifactCodec, CounterStateValidator, EngineApi, SETTLEMENT_ENGINE_FAMILY,
+    SettlementArtifactDigests, SettlementArtifactSizes, SettlementConfig, SettlementConfigArtifact,
+    SettlementConfigArtifactCodec, SettlementDemoCatalog, SettlementDemoScenarioView,
+    SettlementDeterminismReport, SettlementEngine, SettlementExpectationCheck,
+    SettlementFixtureInteropBundle, SettlementGoldenFixture, SettlementGoldenFixtureCodec,
+    SettlementGoldenFixtureResult, SettlementInteropArtifacts, SettlementParitySummary,
+    SettlementRecordedReplay, SettlementReplayArtifact, SettlementReplayArtifactCodec,
+    SettlementReplayLog, SettlementReplayResult, SettlementScenario, SettlementScenarioCase,
+    SettlementScenarioExecutionResult, SettlementScenarioInteropBundle,
+    SettlementScenarioVerificationResult, SettlementScheduler, SettlementSnapshotArtifact,
+    SettlementSnapshotArtifactCodec, SettlementTickDigestView, build_counter_config_artifact,
+    build_counter_scenario, build_settlement_case, build_settlement_config_artifact,
+    build_settlement_demo_catalog, build_settlement_scenario, counter_config_artifact_codec,
+    counter_config_artifact_digest, counter_config_with_policy, counter_engine_with_config,
+    counter_engine_with_policy, counter_golden_fixture_codec, counter_golden_fixture_digest,
+    counter_parity_summary, counter_replay_artifact_codec, counter_replay_artifact_digest,
+    counter_replay_summary, counter_scenario_codec, counter_scenario_digest,
+    counter_snapshot_artifact_at_tick, counter_snapshot_artifact_codec,
+    counter_snapshot_artifact_digest, counter_snapshot_artifact_from_engine,
+    default_counter_config, default_settlement_config, execute_counter_scenario,
+    execute_counter_scenario_interop_bundle, execute_settlement_scenario,
+    execute_settlement_scenario_interop_bundle, export_counter_config_artifact,
     export_counter_fixture_interop_bundle, export_counter_golden_fixture,
     export_counter_replay_artifact, export_counter_scenario, export_counter_snapshot_artifact,
+    export_settlement_config_artifact, export_settlement_fixture_interop_bundle,
+    export_settlement_golden_fixture, export_settlement_replay_artifact,
+    export_settlement_scenario, export_settlement_snapshot_artifact,
     generate_counter_golden_fixture, generate_counter_golden_fixture_from_scenario,
-    generate_counter_golden_fixture_with_config, import_counter_config_artifact,
-    import_counter_golden_fixture, import_counter_replay_artifact, import_counter_scenario,
-    import_counter_snapshot_artifact, inspect_counter_replay, minimal_counter_engine,
-    record_counter_replay, record_counter_replay_with_config, resume_counter_replay_from_snapshot,
-    resume_counter_replay_from_snapshot_with_config, verify_counter_golden_fixture,
-    verify_counter_replay, verify_counter_replay_with_config, verify_counter_scenario,
+    generate_counter_golden_fixture_with_config, generate_settlement_golden_fixture_from_scenario,
+    import_counter_config_artifact, import_counter_golden_fixture, import_counter_replay_artifact,
+    import_counter_scenario, import_counter_snapshot_artifact, import_settlement_config_artifact,
+    import_settlement_golden_fixture, import_settlement_replay_artifact,
+    import_settlement_scenario, import_settlement_snapshot_artifact, inspect_counter_replay,
+    inspect_settlement_replay, minimal_counter_engine, record_counter_replay,
+    record_counter_replay_with_config, record_settlement_replay_with_config,
+    resume_counter_replay_from_snapshot, resume_counter_replay_from_snapshot_with_config,
+    resume_settlement_replay_from_snapshot_with_config, settlement_config_artifact_codec,
+    settlement_config_artifact_digest, settlement_demo_cases, settlement_golden_fixture_codec,
+    settlement_golden_fixture_digest, settlement_parity_summary, settlement_replay_artifact_codec,
+    settlement_replay_artifact_digest, settlement_replay_summary, settlement_scenario_codec,
+    settlement_scenario_digest, settlement_snapshot_artifact_at_tick,
+    settlement_snapshot_artifact_codec, settlement_snapshot_artifact_digest,
+    verify_counter_golden_fixture, verify_counter_replay, verify_counter_replay_with_config,
+    verify_counter_scenario, verify_settlement_golden_fixture,
+    verify_settlement_replay_with_config, verify_settlement_scenario,
 };
 pub use bindings::EngineBinding;
 pub use config::{
@@ -85,7 +113,16 @@ pub use scenario::{
 pub use scheduler::{FixedScheduler, PhaseDescriptor, PhaseGroup, Scheduler};
 pub use serialization::{
     CounterCommandTextSerializer, CounterConfigTextSerializer, CounterSnapshotTextSerializer,
-    SerializationError, Serializer,
+    SerializationError, Serializer, SettlementCommandTextSerializer,
+    SettlementConfigTextSerializer, SettlementSnapshotTextSerializer,
+};
+pub use settlement::{
+    ApplySettlementAllocationPhase, FinalizeSettlementPhase, ResetSettlementFinalizeMarkerPhase,
+    ResolveSettlementStatusPhase, ResourceKind, SettlementCommand, SettlementNamedScenario,
+    SettlementProductionPhase, SettlementRunSummary, SettlementScenarioExpectation,
+    SettlementSimulationConfig, SettlementSnapshot, SettlementState, SettlementStateValidator,
+    SettlementStatus, StageSettlementCommandPhase, WorkerAllocation, settlement_demo_scenarios,
+    settlement_input_frames,
 };
 pub use state::{
     CounterEntityInit, CounterEntitySnapshot, CounterSnapshot, CounterState, EntityId,

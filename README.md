@@ -74,6 +74,17 @@ Rust workspace validation:
 cargo test --manifest-path rust/Cargo.toml
 ```
 
+Settlement vertical-slice demo:
+
+```bash
+cargo run --manifest-path rust/Cargo.toml --example settlement_site_demo
+```
+
+That command executes the deterministic settlement economy slice, exports a
+generated TypeScript contract into `../xenor-web/app/lib/generated/`, and feeds
+the `/simulation` page in `xenor-site` with real replay/snapshot/fixture-backed
+output.
+
 ## Repository Boundaries / Non-goals
 
 - This is not the canonical public website. Use `xenor-site` for that.
@@ -103,6 +114,8 @@ artifact-validation surface:
 - replay verification and snapshot-assisted resume
 - replay inspection and divergence reporting
 - parity summaries for future Rust/C++ comparison
+- a small but real settlement economy slice that proves the stack can run an
+  end-to-end deterministic scenario instead of only foundation tests
 
 ## Further Reading
 

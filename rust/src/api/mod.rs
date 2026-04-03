@@ -1,3 +1,7 @@
+mod settlement;
+
+pub use settlement::*;
+
 use crate::config::{ConfigArtifact, ConfigArtifactSerializer, CounterSimulationConfig};
 use crate::core::{EngineError, Seed, Tick, mix64};
 use crate::engine::{DeterministicEngine, Engine, SnapshotPolicy};
