@@ -4,11 +4,11 @@ use crate::core::{EngineError, Seed, Tick};
 use crate::input::{Command, InputFrame};
 use crate::scheduler::{PhaseDescriptor, PhaseGroup};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PhaseMarker {
     pub ordinal: usize,
     pub group: PhaseGroup,
-    pub name: &'static str,
+    pub name: String,
 }
 
 impl From<PhaseDescriptor> for PhaseMarker {
@@ -16,7 +16,7 @@ impl From<PhaseDescriptor> for PhaseMarker {
         Self {
             ordinal: value.ordinal,
             group: value.group,
-            name: value.name,
+            name: value.name.to_string(),
         }
     }
 }
@@ -27,12 +27,19 @@ pub enum SnapshotCaptureReason {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotMetadata {
+    pub payload_schema_version: u32,
+    pub source_tick: Tick,
+    pub capture_checksum: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotRecord<Snapshot>
 where
     Snapshot: Clone + Eq + fmt::Debug,
 {
-    pub tick: Tick,
+    pub metadata: SnapshotMetadata,
     pub reason: SnapshotCaptureReason,
     pub payload: Snapshot,
 }
@@ -167,13 +174,68 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayTickSummary {
+    pub tick: Tick,
+    pub input_tick: Tick,
+    pub tick_seed: Seed,
+    pub phase_markers: Vec<PhaseMarker>,
+    pub checksum: u64,
+    pub snapshot_present: bool,
+    pub snapshot_source_tick: Option<Tick>,
+    pub snapshot_capture_checksum: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayInspectionView {
+    pub record_count: usize,
+    pub final_tick: Tick,
+    pub tick_summaries: Vec<ReplayTickSummary>,
+}
+
+pub fn inspect_replay_trace<C, Snapshot>(
+    records: &[ReplayTickRecord<C, Snapshot>],
+) -> ReplayInspectionView
+where
+    C: Command,
+    Snapshot: Clone + Eq + fmt::Debug,
+{
+    let tick_summaries = records
+        .iter()
+        .map(|record| ReplayTickSummary {
+            tick: record.tick,
+            input_tick: record.input.tick,
+            tick_seed: record.tick_seed,
+            phase_markers: record.phase_markers.clone(),
+            checksum: record.checksum,
+            snapshot_present: record.snapshot.is_some(),
+            snapshot_source_tick: record
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.metadata.source_tick),
+            snapshot_capture_checksum: record
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.metadata.capture_checksum),
+        })
+        .collect::<Vec<_>>();
+
+    ReplayInspectionView {
+        record_count: records.len(),
+        final_tick: records.last().map(|record| record.tick).unwrap_or(0),
+        tick_summaries,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplayMismatchKind<C, Snapshot>
 where
     C: Command,
     Snapshot: Clone + Eq + fmt::Debug,
 {
-    MissingActualTick,
-    UnexpectedActualTick,
+    TickCount {
+        expected: usize,
+        actual: usize,
+    },
     Tick {
         expected: Tick,
         actual: Tick,
@@ -197,6 +259,18 @@ where
     SnapshotPresence {
         expected: bool,
         actual: bool,
+    },
+    SnapshotReason {
+        expected: SnapshotCaptureReason,
+        actual: SnapshotCaptureReason,
+    },
+    SnapshotMetadata {
+        expected: SnapshotMetadata,
+        actual: SnapshotMetadata,
+    },
+    SnapshotPayloadDigest {
+        expected: u64,
+        actual: u64,
     },
     SnapshotPayload {
         expected: SnapshotRecord<Snapshot>,
@@ -222,15 +296,10 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            ReplayMismatchKind::MissingActualTick => write!(
+            ReplayMismatchKind::TickCount { expected, actual } => write!(
                 f,
-                "missing actual replay record at index {} for tick {:?}",
-                self.record_index, self.tick
-            ),
-            ReplayMismatchKind::UnexpectedActualTick => write!(
-                f,
-                "unexpected actual replay record at index {} for tick {:?}",
-                self.record_index, self.tick
+                "tick count mismatch at index {}: expected {}, got {}",
+                self.record_index, expected, actual
             ),
             ReplayMismatchKind::Tick { expected, actual } => {
                 write!(f, "tick mismatch: expected {expected}, got {actual}")
@@ -238,31 +307,55 @@ where
             ReplayMismatchKind::Input { expected, actual } => {
                 write!(
                     f,
-                    "input mismatch: expected {:?}, got {:?}",
-                    expected, actual
+                    "input mismatch at index {}: expected {:?}, got {:?}",
+                    self.record_index, expected, actual
                 )
             }
             ReplayMismatchKind::TickSeed { expected, actual } => {
-                write!(f, "tick seed mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "tick seed mismatch at index {}: expected {expected}, got {actual}",
+                    self.record_index
+                )
             }
             ReplayMismatchKind::PhaseMarkers { expected, actual } => {
                 write!(
                     f,
-                    "phase marker mismatch: expected {:?}, got {:?}",
-                    expected, actual
+                    "phase marker mismatch at index {}: expected {:?}, got {:?}",
+                    self.record_index, expected, actual
                 )
             }
             ReplayMismatchKind::Checksum { expected, actual } => {
-                write!(f, "checksum mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "checksum mismatch at index {}: expected {expected}, got {actual}",
+                    self.record_index
+                )
             }
             ReplayMismatchKind::SnapshotPresence { expected, actual } => write!(
                 f,
-                "snapshot presence mismatch: expected {expected}, got {actual}"
+                "snapshot presence mismatch at index {}: expected {expected}, got {actual}",
+                self.record_index
+            ),
+            ReplayMismatchKind::SnapshotReason { expected, actual } => write!(
+                f,
+                "snapshot reason mismatch at index {}: expected {:?}, got {:?}",
+                self.record_index, expected, actual
+            ),
+            ReplayMismatchKind::SnapshotMetadata { expected, actual } => write!(
+                f,
+                "snapshot metadata mismatch at index {}: expected {:?}, got {:?}",
+                self.record_index, expected, actual
+            ),
+            ReplayMismatchKind::SnapshotPayloadDigest { expected, actual } => write!(
+                f,
+                "snapshot payload digest mismatch at index {}: expected {}, got {}",
+                self.record_index, expected, actual
             ),
             ReplayMismatchKind::SnapshotPayload { expected, actual } => write!(
                 f,
-                "snapshot payload mismatch: expected {:?}, got {:?}",
-                expected, actual
+                "snapshot payload mismatch at index {}: expected {:?}, got {:?}",
+                self.record_index, expected, actual
             ),
         }
     }
@@ -288,6 +381,23 @@ pub fn compare_replay_traces<C, Snapshot>(
 where
     C: Command,
     Snapshot: Clone + Eq + fmt::Debug,
+{
+    compare_replay_traces_with_snapshot_digest(
+        expected,
+        actual,
+        |_snapshot| -> Result<u64, fmt::Error> { Err(fmt::Error) },
+    )
+}
+
+pub fn compare_replay_traces_with_snapshot_digest<C, Snapshot, D, E>(
+    expected: &[ReplayTickRecord<C, Snapshot>],
+    actual: &[ReplayTickRecord<C, Snapshot>],
+    snapshot_digest: D,
+) -> Result<(), ReplayDivergence<C, Snapshot>>
+where
+    C: Command,
+    Snapshot: Clone + Eq + fmt::Debug,
+    D: Fn(&Snapshot) -> Result<u64, E>,
 {
     let shared_len = expected.len().min(actual.len());
 
@@ -362,39 +472,75 @@ where
             });
         }
 
-        if expected_record.snapshot != actual_record.snapshot {
-            return Err(ReplayDivergence {
-                record_index: index,
-                tick,
-                kind: ReplayMismatchKind::SnapshotPayload {
-                    expected: expected_record
-                        .snapshot
-                        .clone()
-                        .expect("snapshot presence already checked"),
-                    actual: actual_record
-                        .snapshot
-                        .clone()
-                        .expect("snapshot presence already checked"),
-                },
-            });
+        if let (Some(expected_snapshot), Some(actual_snapshot)) =
+            (&expected_record.snapshot, &actual_record.snapshot)
+        {
+            if expected_snapshot.reason != actual_snapshot.reason {
+                return Err(ReplayDivergence {
+                    record_index: index,
+                    tick,
+                    kind: ReplayMismatchKind::SnapshotReason {
+                        expected: expected_snapshot.reason.clone(),
+                        actual: actual_snapshot.reason.clone(),
+                    },
+                });
+            }
+
+            if expected_snapshot.metadata != actual_snapshot.metadata {
+                return Err(ReplayDivergence {
+                    record_index: index,
+                    tick,
+                    kind: ReplayMismatchKind::SnapshotMetadata {
+                        expected: expected_snapshot.metadata,
+                        actual: actual_snapshot.metadata,
+                    },
+                });
+            }
+
+            if expected_snapshot.payload != actual_snapshot.payload {
+                match (
+                    snapshot_digest(&expected_snapshot.payload),
+                    snapshot_digest(&actual_snapshot.payload),
+                ) {
+                    (Ok(expected_digest), Ok(actual_digest)) => {
+                        return Err(ReplayDivergence {
+                            record_index: index,
+                            tick,
+                            kind: ReplayMismatchKind::SnapshotPayloadDigest {
+                                expected: expected_digest,
+                                actual: actual_digest,
+                            },
+                        });
+                    }
+                    _ => {
+                        return Err(ReplayDivergence {
+                            record_index: index,
+                            tick,
+                            kind: ReplayMismatchKind::SnapshotPayload {
+                                expected: expected_snapshot.clone(),
+                                actual: actual_snapshot.clone(),
+                            },
+                        });
+                    }
+                }
+            }
         }
     }
 
-    if expected.len() > actual.len() {
-        let record = &expected[shared_len];
-        return Err(ReplayDivergence {
-            record_index: shared_len,
-            tick: Some(record.tick),
-            kind: ReplayMismatchKind::MissingActualTick,
-        });
-    }
+    if expected.len() != actual.len() {
+        let tick = if let Some(record) = expected.get(shared_len) {
+            Some(record.tick)
+        } else {
+            actual.get(shared_len).map(|record| record.tick)
+        };
 
-    if actual.len() > expected.len() {
-        let record = &actual[shared_len];
         return Err(ReplayDivergence {
             record_index: shared_len,
-            tick: Some(record.tick),
-            kind: ReplayMismatchKind::UnexpectedActualTick,
+            tick,
+            kind: ReplayMismatchKind::TickCount {
+                expected: expected.len(),
+                actual: actual.len(),
+            },
         });
     }
 

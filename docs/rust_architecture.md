@@ -43,7 +43,13 @@ The engine is best treated as a deterministic execution kernel composed of:
 - `replay`
   Deterministic recording of inputs, phase execution, snapshots, and checksums.
 - `serialization`
-  Deterministic snapshot encoding and decoding with explicit schema versioning.
+  Deterministic command and snapshot payload encoding with explicit payload
+  schema versioning.
+- `fixture`
+  Canonical golden fixture generation, import/export, and verification for
+  replay-based regression and future parity work.
+- `parity`
+  Small comparison surface for digest-oriented Rust/C++ parity preparation.
 - `engine`
   Main loop orchestration. This is where seed, input, phases, replay, and
   snapshots meet.
@@ -87,7 +93,10 @@ rust/
     input/
     rng/
     replay/
+    persistence/
     serialization/
+    fixture/
+    parity/
     phases/
     scheduler/
     engine/
@@ -107,9 +116,19 @@ rust/
 - `rng`
   `Rng` trait and seeded deterministic implementations.
 - `replay`
-  `ReplayLog` trait plus in-memory log implementation for tests and debugging.
+  `ReplayLog` trait, append-only tick records, snapshot metadata, and
+  divergence reporting.
+- `persistence`
+  Versioned replay and snapshot artifact codecs, summary generation, and
+  deterministic replay execution helpers.
 - `serialization`
-  `Serializer` trait and deterministic schema-oriented encoding examples.
+  `Serializer` trait and deterministic schema-oriented payload codecs.
+- `fixture`
+  Golden fixture bundle surface with versioned summary and deterministic
+  import/export helpers.
+- `parity`
+  Digest-oriented summary structs and mismatch reporting for future cross-engine
+  comparison.
 - `phases`
   `Phase` trait and `TickContext`.
 - `scheduler`
@@ -129,8 +148,11 @@ rust/
   May depend on `core` only.
 - `replay`
   May depend on `core`, `input`, `state`.
+- `persistence`
+  May depend on `core`, `input`, `state`, `replay`, `engine`, and
+  `serialization`.
 - `serialization`
-  May depend on `core`, `state`, `replay`.
+  May depend on `core`, `state`, `input`.
 - `phases`
   May depend on `core`, `input`, `state`, `rng`, `replay`.
 - `scheduler`
@@ -248,7 +270,8 @@ trait Serializer<T> {
 10. Engine applies explicit snapshot cadence policy:
     `Never`, `Every { interval }`, or `Manual`.
 11. Engine finalizes the replay tick record with checksum, phase markers, and
-    optional snapshot payload.
+    optional snapshot payload plus snapshot metadata
+    `(payload_schema_version, source_tick, capture_checksum)`.
 
 ### Main Loop Pseudocode
 
@@ -274,10 +297,17 @@ fn tick(&mut self, frame: InputFrame<I>) -> Result<TickResult<S>, EngineError> {
     self.state.set_tick(tick);
 
     let checksum = self.state.checksum();
-    let snapshot = self.snapshot_policy.should_capture(tick).map(|reason| SnapshotRecord {
-        tick,
-        reason,
-        payload: self.state.snapshot(),
+    let snapshot = self.snapshot_policy.should_capture(tick).map(|reason| {
+        let payload = self.state.snapshot();
+        SnapshotRecord {
+            metadata: SnapshotMetadata {
+                payload_schema_version: S::snapshot_schema_version(),
+                source_tick: tick,
+                capture_checksum: checksum,
+            },
+            reason,
+            payload,
+        }
     });
 
     self.replay.complete_tick(checksum, snapshot.clone())?;
@@ -332,6 +362,9 @@ Then branching inside one phase affects only that phase’s local stream.
 - phase execution markers
 - per-tick checksum
 - optional snapshots at configured intervals
+- replay artifact metadata:
+  base seed, total ticks, snapshot policy, command payload schema version,
+  snapshot payload schema version, and replay artifact schema version
 
 The current Rust baseline records replay as append-only tick records, not a flat
 event stream. Each record contains:
@@ -341,50 +374,119 @@ event stream. Each record contains:
 - derived tick seed
 - ordered phase markers with group + ordinal
 - checksum
-- optional snapshot record with capture reason and payload
+- optional snapshot record with capture reason, schema version, source tick,
+  capture checksum, and payload
+- optional replay inspection view with deterministic per-tick summaries:
+  phase markers, checksum, snapshot presence, and snapshot metadata pointers
 
 ### Modes
 
-- full replay
-  Start from the seed and replay every input frame from tick 1.
-- fast-forward replay
-  Load the latest compatible snapshot, then replay the remaining input frames.
+- record mode
+  Run from seed with explicit input frames, record append-only replay records,
+  and emit a deterministic replay artifact.
+- replay verify mode
+  Decode a replay artifact, rerun from the recorded seed and policy, and fail on
+  the first divergence.
+- replay from snapshot mode
+  Restore a compatible snapshot artifact, validate replay continuation from the
+  next tick, and continue execution through the remaining replay records.
 
 ### Debug Capability
 
 - step-by-step replay through logged tick and phase boundaries
 - divergence detection on first mismatch across input, tick seed, phase marker
-  ordering, checksum, and snapshot presence or payload
+  ordering, checksum, tick count, snapshot metadata, and snapshot payload digest
 - snapshot-assisted bisecting when desync begins after a known checkpoint
+- replay/snapshot artifacts suitable for golden fixtures and future Rust/C++
+  parity checks
+
+### Replay Inspection Surface
+
+The current Rust baseline also exposes a deterministic inspection view over a
+recorded trace:
+
+- `ReplayInspectionView`
+  Stable top-level trace summary with record count and final tick.
+- `ReplayTickSummary`
+  Per-tick input tick, derived tick seed, phase markers, checksum, and snapshot
+  presence.
+
+This surface is intentionally library-only. It exists to make test failures and
+desync investigation easier without weakening replay strictness.
 
 ## Serialization
 
 ### Model
 
-Snapshots must be serializable from semantic fields, not raw memory.
+Snapshots and replay artifacts must be serializable from semantic fields, not
+raw memory.
 
 Recommended baseline:
 
 - explicit serializer trait
-- explicit schema version
+- explicit payload schema version
+- explicit replay artifact schema version
+- explicit snapshot artifact schema version
 - deterministic field ordering
 - integer/fixed-width numeric encoding
+- canonical delimiter and escaping rules
+- no ambiguous optional fields
+- export -> import -> export must be byte-for-byte identical
 
-The skeleton includes a deterministic text serializer example because it is easy
-to inspect and version while keeping memory-layout dependence out of the design.
-Binary encoding can come later, but it should still be field-oriented and
-versioned.
+The current baseline uses deterministic text artifacts because they are easy to
+inspect, diff, and version while keeping memory-layout dependence out of the
+design. Binary encoding can come later, but it should still be field-oriented
+and versioned.
+
+The current Rust implementation hardens that text encoding with:
+
+- fixed `artifact=` / `canonical_encoding=` headers
+- fixed field order per artifact and payload type
+- hex encoding for free-form strings and nested artifact bytes
+- fail-fast decode for duplicate keys, missing required keys, invalid field
+  order, unsupported schema versions, and trailing malformed content
+- canonical digest generation from exported bytes for replay, snapshot, and
+  fixture parity checks
 
 ### Versioning Constraint
 
 Replay validity across versions is only possible when:
 
-- input schema remains compatible or versioned
-- snapshot schema is versioned
+- input payload schema remains compatible or versioned
+- snapshot payload schema is versioned
+- replay artifact schema is versioned
+- snapshot artifact schema is versioned
 - checksum semantics are stable or explicitly versioned
 
 If compatibility is not guaranteed, fail fast instead of silently attempting
 replay with mismatched state layouts.
+
+Artifact schema versions and payload schema versions must stay separate.
+Artifacts describe bundle/container layout. Payload schemas describe command and
+snapshot contracts. The decoder must never guess between them.
+
+## Golden Fixtures + Parity Prep
+
+The Rust baseline now treats golden fixtures as a first-class library surface.
+
+- `GoldenFixture`
+  Versioned bundle containing replay artifact, optional snapshot artifact, and a
+  summary.
+- `GoldenFixtureSummary`
+  Stable summary with seed, final tick, final checksum, schema versions, replay
+  digest, and optional snapshot digest.
+- `GoldenFixtureResult`
+  Verification report containing summary comparison plus replay/snapshot
+  mismatch details.
+- `ParityArtifactSummary`
+  Minimal digest-oriented summary for future Rust/C++ comparison.
+- `ParityComparison`
+  Ordered mismatch list across base seed, final tick, final checksum, replay
+  digest, and optional snapshot digest.
+
+This is deliberately library-level only. There is no large file-I/O layer here.
+The goal is to make parity fixtures deterministic, inspectable, and easy to
+assert in tests before any external Rust/C++ integration is attempted.
 
 ## Determinism Rules
 
@@ -473,10 +575,17 @@ The repository now includes an isolated Rust core under `rust/` with:
 - grouped fixed scheduler inspection through `PhaseDescriptor` and `PhaseGroup`
 - append-only replay tick records with phase markers and divergence checking
 - explicit snapshot cadence policy through `SnapshotPolicy`
+- versioned replay artifact persistence with deterministic encode/decode
+- versioned snapshot artifacts with metadata validation on restore
+- canonical golden fixture generation, import/export, and verification
+- parity summary and comparison helpers for future Rust/C++ fixture work
+- replay inspection views for deterministic mismatch debugging
+- fast-forward replay verification from compatible snapshot checkpoints
 - one example state type and command pipeline that makes phase ordering observable
 - one deterministic serializer example
-- regression tests for replay equality, tick-order failure, snapshot cadence,
-  restore-and-continue, and replay divergence reporting
+- regression tests for replay equality, canonical re-export, schema version
+  gating, golden fixture verification, snapshot-backed resume, replay inspection,
+  parity summaries, and richer replay divergence reporting
 
 This Rust core remains intentionally narrow. It is a deterministic architecture
 and validation surface for future native and web bindings, not a replacement

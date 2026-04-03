@@ -3,7 +3,9 @@ use std::marker::PhantomData;
 use crate::core::{EngineError, Seed, Tick, tick_seed};
 use crate::input::{Command, InputFrame};
 use crate::phases::{Phase, TickContext};
-use crate::replay::{ReplayLog, SnapshotCaptureReason, SnapshotRecord};
+use crate::replay::{
+    ReplayLog, ReplayTickRecord, SnapshotCaptureReason, SnapshotMetadata, SnapshotRecord,
+};
 use crate::rng::Rng;
 use crate::scheduler::{FixedScheduler, PhaseDescriptor, Scheduler};
 use crate::serialization::Serializer;
@@ -41,6 +43,12 @@ pub trait Engine<C: Command> {
     fn seed(&self) -> Seed;
     fn state(&self) -> &Self::State;
     fn tick(&mut self, frame: InputFrame<C>) -> Result<TickResult<Self::State>, EngineError>;
+}
+
+pub trait ReplayableEngine<C: Command>: Engine<C> {
+    fn snapshot_policy(&self) -> SnapshotPolicy;
+    fn restore_snapshot(&mut self, snapshot: <Self::State as SimulationState>::Snapshot);
+    fn replay_records(&self) -> &[ReplayTickRecord<C, <Self::State as SimulationState>::Snapshot>];
 }
 
 pub struct DeterministicEngine<S, C, R, L, Sch = FixedScheduler<S, C, R, L>>
@@ -96,10 +104,15 @@ where
     }
 
     pub fn manual_snapshot(&self) -> SnapshotRecord<S::Snapshot> {
+        let payload = self.state.snapshot();
         SnapshotRecord {
-            tick: self.state.tick(),
+            metadata: SnapshotMetadata {
+                payload_schema_version: S::snapshot_schema_version(),
+                source_tick: S::snapshot_tick(&payload),
+                capture_checksum: S::snapshot_checksum(&payload),
+            },
             reason: SnapshotCaptureReason::Manual,
-            payload: self.state.snapshot(),
+            payload,
         }
     }
 
@@ -116,7 +129,7 @@ where
         serializer
             .encode(&snapshot.payload)
             .map_err(|error| EngineError::SnapshotSerialization {
-                tick: snapshot.tick,
+                tick: snapshot.metadata.source_tick,
                 reason: error.to_string(),
             })
     }
@@ -186,15 +199,20 @@ where
     fn apply_snapshot_policy(
         &self,
         tick: Tick,
-    ) -> Result<Option<SnapshotRecord<S::Snapshot>>, EngineError> {
-        match self.snapshot_policy.should_capture(tick) {
-            Some(reason) => Ok(Some(SnapshotRecord {
-                tick,
+        checksum: u64,
+    ) -> Option<SnapshotRecord<S::Snapshot>> {
+        self.snapshot_policy.should_capture(tick).map(|reason| {
+            let payload = self.state.snapshot();
+            SnapshotRecord {
+                metadata: SnapshotMetadata {
+                    payload_schema_version: S::snapshot_schema_version(),
+                    source_tick: tick,
+                    capture_checksum: checksum,
+                },
                 reason,
-                payload: self.state.snapshot(),
-            })),
-            None => Ok(None),
-        }
+                payload,
+            }
+        })
     }
 
     fn finalize_replay_record(
@@ -231,7 +249,7 @@ where
         self.run_scheduler_phases(&frame, tick, tick_seed)?;
         self.advance_authoritative_tick(tick);
         let checksum = self.compute_checksum();
-        let snapshot_record = self.apply_snapshot_policy(tick)?;
+        let snapshot_record = self.apply_snapshot_policy(tick, checksum);
         let snapshot_payload = snapshot_record
             .as_ref()
             .map(|snapshot| snapshot.payload.clone());
@@ -242,5 +260,26 @@ where
             checksum,
             snapshot: snapshot_payload,
         })
+    }
+}
+
+impl<S, C, R, L, Sch> ReplayableEngine<C> for DeterministicEngine<S, C, R, L, Sch>
+where
+    S: SimulationState,
+    C: Command,
+    R: Rng,
+    L: ReplayLog<C, S::Snapshot>,
+    Sch: Scheduler<S, C, R, L>,
+{
+    fn snapshot_policy(&self) -> SnapshotPolicy {
+        self.snapshot_policy
+    }
+
+    fn restore_snapshot(&mut self, snapshot: <Self::State as SimulationState>::Snapshot) {
+        DeterministicEngine::restore_snapshot(self, snapshot);
+    }
+
+    fn replay_records(&self) -> &[ReplayTickRecord<C, <Self::State as SimulationState>::Snapshot>] {
+        self.replay_log.records()
     }
 }

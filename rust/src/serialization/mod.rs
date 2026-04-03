@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::api::CounterCommand;
+use crate::canonical::{CANONICAL_TEXT_ENCODING, CanonicalLineReader, CanonicalLineWriter};
 use crate::state::CounterSnapshot;
 
 pub trait Serializer<T> {
@@ -23,6 +25,73 @@ impl fmt::Display for SerializationError {
 impl Error for SerializationError {}
 
 #[derive(Clone, Debug, Default)]
+pub struct CounterCommandTextSerializer;
+
+impl Serializer<CounterCommand> for CounterCommandTextSerializer {
+    type Error = SerializationError;
+
+    fn schema_version(&self) -> u32 {
+        1
+    }
+
+    fn encode(&self, value: &CounterCommand) -> Result<Vec<u8>, Self::Error> {
+        let mut writer = CanonicalLineWriter::default();
+        writer.push_display("payload_kind", "counter_command");
+        writer.push_display("canonical_encoding", CANONICAL_TEXT_ENCODING);
+        writer.push_display("command_payload_schema_version", self.schema_version());
+        writer.push_display("delta", value.delta);
+        writer.push_display("consume_entropy", encode_bool(value.consume_entropy));
+        Ok(writer.finish())
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<CounterCommand, Self::Error> {
+        let mut reader = CanonicalLineReader::new(bytes, "counter command payload")
+            .map_err(|error| SerializationError(error.to_string()))?;
+        reader
+            .expect_value("payload_kind", "counter_command", "counter command payload")
+            .map_err(|error| SerializationError(error.to_string()))?;
+        reader
+            .expect_value(
+                "canonical_encoding",
+                CANONICAL_TEXT_ENCODING,
+                "counter command payload",
+            )
+            .map_err(|error| SerializationError(error.to_string()))?;
+
+        let version = parse_u32(
+            reader
+                .read_value("command_payload_schema_version", "counter command payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        if version != self.schema_version() {
+            return Err(SerializationError(format!(
+                "unsupported command payload schema version: {version}",
+            )));
+        }
+
+        let delta = parse_i64(
+            reader
+                .read_value("delta", "counter command payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        let consume_entropy = parse_bool(
+            reader
+                .read_value("consume_entropy", "counter command payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+
+        reader
+            .finish("counter command payload")
+            .map_err(|error| SerializationError(error.to_string()))?;
+
+        Ok(CounterCommand {
+            delta,
+            consume_entropy,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct CounterSnapshotTextSerializer;
 
 impl Serializer<CounterSnapshot> for CounterSnapshotTextSerializer {
@@ -33,71 +102,113 @@ impl Serializer<CounterSnapshot> for CounterSnapshotTextSerializer {
     }
 
     fn encode(&self, value: &CounterSnapshot) -> Result<Vec<u8>, Self::Error> {
-        Ok(format!(
-            "v={}\ntick={}\nvalue={}\nvelocity={}\npending_delta={}\npending_entropy={}\nentropy_budget={}\nfinalize_marker={}\n",
-            self.schema_version(),
-            value.tick,
-            value.value,
-            value.velocity,
-            value.pending_delta,
-            value.pending_entropy,
-            value.entropy_budget,
-            value.finalize_marker
-        )
-        .into_bytes())
+        let mut writer = CanonicalLineWriter::default();
+        writer.push_display("payload_kind", "counter_snapshot");
+        writer.push_display("canonical_encoding", CANONICAL_TEXT_ENCODING);
+        writer.push_display("snapshot_payload_schema_version", self.schema_version());
+        writer.push_display("tick", value.tick);
+        writer.push_display("value", value.value);
+        writer.push_display("velocity", value.velocity);
+        writer.push_display("pending_delta", value.pending_delta);
+        writer.push_display("pending_entropy", value.pending_entropy);
+        writer.push_display("entropy_budget", value.entropy_budget);
+        writer.push_display("finalize_marker", value.finalize_marker);
+        Ok(writer.finish())
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<CounterSnapshot, Self::Error> {
-        let text = std::str::from_utf8(bytes)
-            .map_err(|error| SerializationError(format!("invalid utf8: {error}")))?;
+        let mut reader = CanonicalLineReader::new(bytes, "counter snapshot payload")
+            .map_err(|error| SerializationError(error.to_string()))?;
+        reader
+            .expect_value(
+                "payload_kind",
+                "counter_snapshot",
+                "counter snapshot payload",
+            )
+            .map_err(|error| SerializationError(error.to_string()))?;
+        reader
+            .expect_value(
+                "canonical_encoding",
+                CANONICAL_TEXT_ENCODING,
+                "counter snapshot payload",
+            )
+            .map_err(|error| SerializationError(error.to_string()))?;
 
-        let mut version = None;
-        let mut tick = None;
-        let mut value = None;
-        let mut velocity = None;
-        let mut pending_delta = None;
-        let mut pending_entropy = None;
-        let mut entropy_budget = None;
-        let mut finalize_marker = None;
-
-        for line in text.lines() {
-            let (key, raw_value) = line
-                .split_once('=')
-                .ok_or_else(|| SerializationError(format!("invalid line: {line}")))?;
-
-            match key {
-                "v" => version = Some(parse_u32(raw_value)?),
-                "tick" => tick = Some(parse_u64(raw_value)?),
-                "value" => value = Some(parse_i64(raw_value)?),
-                "velocity" => velocity = Some(parse_i64(raw_value)?),
-                "pending_delta" => pending_delta = Some(parse_i64(raw_value)?),
-                "pending_entropy" => pending_entropy = Some(parse_u64(raw_value)?),
-                "entropy_budget" => entropy_budget = Some(parse_u64(raw_value)?),
-                "finalize_marker" => finalize_marker = Some(parse_u64(raw_value)?),
-                _ => return Err(SerializationError(format!("unexpected field: {key}"))),
-            }
-        }
-
-        if version != Some(self.schema_version()) {
+        let version = parse_u32(
+            reader
+                .read_value(
+                    "snapshot_payload_schema_version",
+                    "counter snapshot payload",
+                )
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        if version != self.schema_version() {
             return Err(SerializationError(format!(
-                "unsupported schema version: {:?}",
-                version
+                "unsupported snapshot payload schema version: {version}",
             )));
         }
 
+        let tick = parse_u64(
+            reader
+                .read_value("tick", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        let value = parse_i64(
+            reader
+                .read_value("value", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        let velocity = parse_i64(
+            reader
+                .read_value("velocity", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        let pending_delta = parse_i64(
+            reader
+                .read_value("pending_delta", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        let pending_entropy = parse_u64(
+            reader
+                .read_value("pending_entropy", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        let entropy_budget = parse_u64(
+            reader
+                .read_value("entropy_budget", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+        let finalize_marker = parse_u64(
+            reader
+                .read_value("finalize_marker", "counter snapshot payload")
+                .map_err(|error| SerializationError(error.to_string()))?,
+        )?;
+
+        reader
+            .finish("counter snapshot payload")
+            .map_err(|error| SerializationError(error.to_string()))?;
+
         Ok(CounterSnapshot {
-            tick: tick.ok_or_else(|| SerializationError("missing tick".into()))?,
-            value: value.ok_or_else(|| SerializationError("missing value".into()))?,
-            velocity: velocity.ok_or_else(|| SerializationError("missing velocity".into()))?,
-            pending_delta: pending_delta
-                .ok_or_else(|| SerializationError("missing pending_delta".into()))?,
-            pending_entropy: pending_entropy
-                .ok_or_else(|| SerializationError("missing pending_entropy".into()))?,
-            entropy_budget: entropy_budget
-                .ok_or_else(|| SerializationError("missing entropy_budget".into()))?,
-            finalize_marker: finalize_marker
-                .ok_or_else(|| SerializationError("missing finalize_marker".into()))?,
+            tick,
+            value,
+            velocity,
+            pending_delta,
+            pending_entropy,
+            entropy_budget,
+            finalize_marker,
         })
+    }
+}
+
+fn encode_bool(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+fn parse_bool(value: &str) -> Result<bool, SerializationError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(SerializationError(format!("invalid bool `{value}`"))),
     }
 }
 

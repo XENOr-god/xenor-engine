@@ -2,9 +2,13 @@
 
 pub mod api;
 pub mod bindings;
+mod canonical;
 pub mod core;
 pub mod engine;
+pub mod fixture;
 pub mod input;
+pub mod parity;
+pub mod persistence;
 pub mod phases;
 pub mod replay;
 pub mod rng;
@@ -13,31 +17,67 @@ pub mod serialization;
 pub mod state;
 
 pub use api::{
-    CounterCommand, CounterEngine, EngineApi, counter_engine_with_policy, minimal_counter_engine,
+    COUNTER_ENGINE_FAMILY, CounterCommand, CounterEngine, CounterGoldenFixture,
+    CounterGoldenFixtureCodec, CounterGoldenFixtureResult, CounterParitySummary,
+    CounterRecordedReplay, CounterReplayArtifact, CounterReplayArtifactCodec, CounterReplayResult,
+    CounterSnapshotArtifact, EngineApi, counter_engine_with_policy, counter_golden_fixture_codec,
+    counter_parity_summary, counter_replay_artifact_codec, counter_replay_summary,
+    counter_snapshot_artifact_at_tick, counter_snapshot_artifact_codec,
+    export_counter_golden_fixture, export_counter_replay_artifact,
+    export_counter_snapshot_artifact, generate_counter_golden_fixture,
+    import_counter_golden_fixture, import_counter_replay_artifact,
+    import_counter_snapshot_artifact, inspect_counter_replay, minimal_counter_engine,
+    record_counter_replay, resume_counter_replay_from_snapshot, verify_counter_golden_fixture,
+    verify_counter_replay,
 };
 pub use bindings::EngineBinding;
 pub use core::{EngineError, Seed, Tick};
-pub use engine::{DeterministicEngine, Engine, SnapshotPolicy, TickResult};
+pub use engine::{DeterministicEngine, Engine, ReplayableEngine, SnapshotPolicy, TickResult};
+pub use fixture::{
+    GOLDEN_FIXTURE_SCHEMA_VERSION, GoldenFixture, GoldenFixtureMetadata, GoldenFixtureResult,
+    GoldenFixtureSerializer, GoldenFixtureSummary,
+};
 pub use input::{Command, InputFrame};
+pub use parity::{
+    ParityArtifactSummary, ParityComparison, ParityMismatch, compare_parity_summaries,
+};
+pub use persistence::{
+    ArtifactSummary, REPLAY_ARTIFACT_SCHEMA_VERSION, RecordedReplay, ReplayArtifact,
+    ReplayArtifactMetadata, ReplayArtifactSerializer, ReplayExecutionMode, ReplayExecutionResult,
+    SNAPSHOT_ARTIFACT_SCHEMA_VERSION, SnapshotArtifact, SnapshotArtifactMetadata,
+    SnapshotArtifactSerializer, execute_replay_from_snapshot, execute_replay_verify, record_replay,
+    validate_snapshot_artifact,
+};
 pub use phases::{Phase, TickContext};
 pub use replay::{
-    InMemoryReplayLog, PhaseMarker, ReplayDivergence, ReplayLog, ReplayMismatchKind,
-    ReplayTickRecord, SnapshotCaptureReason, SnapshotRecord, compare_replay_traces,
+    InMemoryReplayLog, PhaseMarker, ReplayDivergence, ReplayInspectionView, ReplayLog,
+    ReplayMismatchKind, ReplayTickRecord, ReplayTickSummary, SnapshotCaptureReason,
+    SnapshotMetadata, SnapshotRecord, compare_replay_traces,
+    compare_replay_traces_with_snapshot_digest, inspect_replay_trace,
 };
 pub use rng::{Rng, SplitMix64};
 pub use scheduler::{FixedScheduler, PhaseDescriptor, PhaseGroup, Scheduler};
-pub use serialization::{CounterSnapshotTextSerializer, SerializationError, Serializer};
+pub use serialization::{
+    CounterCommandTextSerializer, CounterSnapshotTextSerializer, SerializationError, Serializer,
+};
 pub use state::{CounterSnapshot, CounterState, SimulationState};
 
 #[cfg(test)]
 mod tests {
     use crate::api::{
-        CounterCommand, build_counter_engine, default_counter_scheduler, minimal_counter_engine,
-        reordered_counter_scheduler,
+        CounterCommand, build_counter_engine, counter_golden_fixture_codec, counter_parity_summary,
+        counter_replay_artifact_codec, counter_replay_summary, default_counter_scheduler,
+        export_counter_golden_fixture, export_counter_replay_artifact,
+        export_counter_snapshot_artifact, generate_counter_golden_fixture,
+        import_counter_golden_fixture, import_counter_replay_artifact,
+        import_counter_snapshot_artifact, inspect_counter_replay, minimal_counter_engine,
+        record_counter_replay, reordered_counter_scheduler, resume_counter_replay_from_snapshot,
+        verify_counter_golden_fixture, verify_counter_replay,
     };
     use crate::core::EngineError;
     use crate::engine::{Engine, SnapshotPolicy};
     use crate::input::InputFrame;
+    use crate::parity::{ParityArtifactSummary, ParityMismatch, compare_parity_summaries};
     use crate::replay::{ReplayLog, ReplayMismatchKind, compare_replay_traces};
     use crate::scheduler::{PhaseGroup, Scheduler};
     use crate::serialization::{CounterSnapshotTextSerializer, Serializer};
@@ -74,6 +114,14 @@ mod tests {
                 },
             ),
         ]
+    }
+
+    fn remove_line(text: &str, prefix: &str) -> String {
+        let kept = text
+            .lines()
+            .filter(|line| !line.starts_with(prefix))
+            .collect::<Vec<_>>();
+        format!("{}\n", kept.join("\n"))
     }
 
     #[test]
@@ -229,7 +277,12 @@ mod tests {
             .replay_log()
             .records()
             .iter()
-            .filter_map(|record| record.snapshot.as_ref().map(|snapshot| snapshot.tick))
+            .filter_map(|record| {
+                record
+                    .snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.metadata.source_tick)
+            })
             .collect::<Vec<_>>();
 
         assert_eq!(captured_ticks, vec![2, 4]);
@@ -282,68 +335,384 @@ mod tests {
     }
 
     #[test]
-    fn restoring_a_snapshot_and_continuing_matches_full_run() {
-        let frames = sample_frames();
-        let mut full_run = build_counter_engine(
-            123,
-            default_counter_scheduler(),
-            SnapshotPolicy::Every { interval: 2 },
-        );
+    fn replay_divergence_reports_tick_count_mismatch() {
+        let recorded = record_counter_replay(80, SnapshotPolicy::Never, &sample_frames())
+            .expect("record mode should succeed");
+        let shorter = &recorded.artifact.records[..2];
+        let longer = &recorded.artifact.records[..3];
 
-        for frame in frames.clone() {
-            full_run.tick(frame).expect("full run should succeed");
-        }
+        let divergence =
+            compare_replay_traces(shorter, longer).expect_err("tick count mismatch should fail");
 
-        let snapshot = full_run.replay_log().records()[1]
-            .snapshot
-            .as_ref()
-            .expect("tick 2 snapshot should exist")
-            .payload
-            .clone();
-        let expected_checksum = full_run
-            .replay_log()
-            .records()
-            .last()
-            .expect("full replay should have records")
-            .checksum;
-
-        let mut resumed = build_counter_engine(
-            123,
-            default_counter_scheduler(),
-            SnapshotPolicy::Every { interval: 2 },
-        );
-        resumed.restore_snapshot(snapshot);
-
-        for frame in sample_frames().into_iter().skip(2) {
-            resumed.tick(frame).expect("resumed run should succeed");
-        }
-
-        let resumed_checksum = resumed
-            .replay_log()
-            .records()
-            .last()
-            .expect("resumed replay should have records")
-            .checksum;
-
-        assert_eq!(full_run.state().snapshot(), resumed.state().snapshot());
-        assert_eq!(expected_checksum, resumed_checksum);
+        assert_eq!(divergence.record_index, 2);
+        assert_eq!(divergence.tick, Some(3));
+        assert!(matches!(
+            divergence.kind,
+            ReplayMismatchKind::TickCount {
+                expected: 2,
+                actual: 3
+            }
+        ));
     }
 
     #[test]
-    fn golden_style_replay_trace_comparison_passes_for_matching_trace() {
-        let mut engine = build_counter_engine(
-            55,
-            default_counter_scheduler(),
+    fn replay_inspection_view_is_deterministic() {
+        let recorded =
+            record_counter_replay(81, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+
+        let first = inspect_counter_replay(&recorded.artifact);
+        let second = inspect_counter_replay(&recorded.artifact);
+
+        assert_eq!(first, second);
+        assert_eq!(first.record_count, 4);
+        assert_eq!(first.final_tick, 4);
+        assert_eq!(
+            first.tick_summaries[1]
+                .phase_markers
+                .iter()
+                .map(|marker| marker.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "reset_finalize_marker",
+                "apply_counter_input",
+                "simulate_counter",
+                "settle_counter",
+                "finalize_counter",
+            ]
+        );
+        assert!(first.tick_summaries[1].snapshot_present);
+    }
+
+    #[test]
+    fn replay_artifact_roundtrip_serialize_deserialize() {
+        let recorded =
+            record_counter_replay(90, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let bytes = export_counter_replay_artifact(&recorded.artifact)
+            .expect("replay artifact should serialize");
+        let decoded =
+            import_counter_replay_artifact(&bytes).expect("replay artifact should deserialize");
+
+        assert_eq!(recorded.artifact, decoded);
+    }
+
+    #[test]
+    fn snapshot_artifact_roundtrip_serialize_deserialize() {
+        let recorded =
+            record_counter_replay(91, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+        let bytes = export_counter_snapshot_artifact(&snapshot)
+            .expect("snapshot artifact should serialize");
+        let decoded =
+            import_counter_snapshot_artifact(&bytes).expect("snapshot artifact should deserialize");
+
+        assert_eq!(snapshot, decoded);
+    }
+
+    #[test]
+    fn replay_export_import_export_is_canonical_and_identical() {
+        let recorded =
+            record_counter_replay(92, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let first = export_counter_replay_artifact(&recorded.artifact)
+            .expect("replay artifact should serialize");
+        let imported =
+            import_counter_replay_artifact(&first).expect("replay artifact should deserialize");
+        let second = export_counter_replay_artifact(&imported)
+            .expect("re-exported replay artifact should serialize");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn snapshot_export_import_export_is_canonical_and_identical() {
+        let recorded =
+            record_counter_replay(93, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+        let first = export_counter_snapshot_artifact(&snapshot)
+            .expect("snapshot artifact should serialize");
+        let imported =
+            import_counter_snapshot_artifact(&first).expect("snapshot artifact should deserialize");
+        let second = export_counter_snapshot_artifact(&imported)
+            .expect("re-exported snapshot artifact should serialize");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn golden_fixture_export_import_export_is_canonical_and_identical() {
+        let fixture = generate_counter_golden_fixture(
+            94,
             SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        let first = export_counter_golden_fixture(&fixture).expect("fixture export should succeed");
+        let imported =
+            import_counter_golden_fixture(&first).expect("fixture import should succeed");
+        let second =
+            export_counter_golden_fixture(&imported).expect("fixture re-export should succeed");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn canonical_digest_is_stable_for_same_replay_artifact() {
+        let recorded =
+            record_counter_replay(95, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let codec = counter_replay_artifact_codec();
+        let imported = import_counter_replay_artifact(
+            &export_counter_replay_artifact(&recorded.artifact)
+                .expect("replay artifact should serialize"),
+        )
+        .expect("replay artifact should deserialize");
+
+        assert_eq!(
+            codec
+                .digest(&recorded.artifact)
+                .expect("digest should be available"),
+            codec.digest(&imported).expect("digest should be available"),
+        );
+    }
+
+    #[test]
+    fn full_run_matches_resume_from_snapshot() {
+        let recorded =
+            record_counter_replay(123, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+
+        let full = verify_counter_replay(&recorded.artifact)
+            .expect("full replay verification should succeed");
+        let resumed = resume_counter_replay_from_snapshot(&snapshot, &recorded.artifact)
+            .expect("resume from snapshot should succeed");
+
+        assert_eq!(full.final_tick, resumed.final_tick);
+        assert_eq!(full.final_checksum, resumed.final_checksum);
+        assert_eq!(full.summary, resumed.summary);
+    }
+
+    #[test]
+    fn unsupported_replay_version_fails_fast() {
+        let recorded = record_counter_replay(44, SnapshotPolicy::Never, &sample_frames())
+            .expect("record mode should succeed");
+        let bytes = export_counter_replay_artifact(&recorded.artifact)
+            .expect("replay artifact should serialize");
+        let text = String::from_utf8(bytes).expect("artifact bytes should be utf8");
+        let tampered = text.replace("artifact_schema_version=1", "artifact_schema_version=9");
+
+        let error = import_counter_replay_artifact(tampered.as_bytes())
+            .expect_err("unsupported replay version should fail");
+
+        assert_eq!(
+            error,
+            EngineError::UnsupportedSchemaVersion {
+                artifact: "replay artifact",
+                expected: 1,
+                got: 9
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_snapshot_payload_schema_version_fails_fast() {
+        let recorded =
+            record_counter_replay(45, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+        let bytes = export_counter_snapshot_artifact(&snapshot)
+            .expect("snapshot artifact should serialize");
+        let text = String::from_utf8(bytes).expect("artifact bytes should be utf8");
+        let tampered = text.replace(
+            "snapshot_payload_schema_version=1",
+            "snapshot_payload_schema_version=9",
         );
 
-        for frame in sample_frames() {
-            engine.tick(frame).expect("tick should succeed");
-        }
+        let error = import_counter_snapshot_artifact(tampered.as_bytes())
+            .expect_err("unsupported snapshot version should fail");
 
-        let golden = engine.replay_log().records().to_vec();
-        compare_replay_traces(&golden, engine.replay_log().records())
-            .expect("golden replay should match live replay");
+        assert_eq!(
+            error,
+            EngineError::UnsupportedSchemaVersion {
+                artifact: "snapshot payload",
+                expected: 1,
+                got: 9
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_command_payload_schema_version_fails_fast() {
+        let recorded = record_counter_replay(46, SnapshotPolicy::Never, &sample_frames())
+            .expect("record mode should succeed");
+        let bytes = export_counter_replay_artifact(&recorded.artifact)
+            .expect("replay artifact should serialize");
+        let text = String::from_utf8(bytes).expect("artifact bytes should be utf8");
+        let tampered = text.replace(
+            "command_payload_schema_version=1",
+            "command_payload_schema_version=9",
+        );
+
+        let error = import_counter_replay_artifact(tampered.as_bytes())
+            .expect_err("unsupported command payload version should fail");
+
+        assert_eq!(
+            error,
+            EngineError::UnsupportedSchemaVersion {
+                artifact: "replay command payload",
+                expected: 1,
+                got: 9
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_duplicate_replay_section_fails_decode() {
+        let recorded = record_counter_replay(47, SnapshotPolicy::Never, &sample_frames())
+            .expect("record mode should succeed");
+        let bytes = export_counter_replay_artifact(&recorded.artifact)
+            .expect("replay artifact should serialize");
+        let text = String::from_utf8(bytes).expect("artifact bytes should be utf8");
+        let tampered = format!("artifact=replay\n{text}");
+
+        let error = import_counter_replay_artifact(tampered.as_bytes())
+            .expect_err("duplicate artifact header should fail");
+
+        assert!(matches!(
+            error,
+            EngineError::CorruptedArtifact {
+                artifact: "replay",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_required_snapshot_section_fails_decode() {
+        let recorded =
+            record_counter_replay(48, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+        let bytes = export_counter_snapshot_artifact(&snapshot)
+            .expect("snapshot artifact should serialize");
+        let text = String::from_utf8(bytes).expect("artifact bytes should be utf8");
+        let tampered = remove_line(&text, "payload_hex=");
+
+        let error = import_counter_snapshot_artifact(tampered.as_bytes())
+            .expect_err("missing payload_hex should fail");
+
+        assert!(matches!(
+            error,
+            EngineError::CorruptedArtifact {
+                artifact: "snapshot",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn corrupted_replay_artifact_fails_fast() {
+        let recorded = record_counter_replay(49, SnapshotPolicy::Never, &sample_frames())
+            .expect("record mode should succeed");
+        let bytes = export_counter_replay_artifact(&recorded.artifact)
+            .expect("replay artifact should serialize");
+        let text = String::from_utf8(bytes).expect("artifact bytes should be utf8");
+        let tampered = text.replacen("record.0.command_hex=", "record.0.command_hex=abc", 1);
+
+        let error = import_counter_replay_artifact(tampered.as_bytes())
+            .expect_err("corrupted replay artifact should fail");
+
+        assert!(matches!(
+            error,
+            EngineError::CorruptedArtifact {
+                artifact: "replay",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn seed_mismatch_fails_on_resume() {
+        let recorded =
+            record_counter_replay(50, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let mut snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+        snapshot.metadata.base_seed += 1;
+
+        let error = resume_counter_replay_from_snapshot(&snapshot, &recorded.artifact)
+            .expect_err("seed mismatch should fail");
+
+        assert_eq!(
+            error,
+            EngineError::SeedMismatch {
+                expected: 50,
+                got: 51
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_tick_mismatch_with_continuation_fails_fast() {
+        let recorded =
+            record_counter_replay(51, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let snapshot = crate::api::counter_snapshot_artifact_at_tick(&recorded.artifact, 2)
+            .expect("tick 2 snapshot should exist");
+        let mut mismatched = recorded.artifact.clone();
+        mismatched.records.remove(2);
+        mismatched.metadata.record_count = mismatched.records.len();
+
+        let error = resume_counter_replay_from_snapshot(&snapshot, &mismatched)
+            .expect_err("resume tick mismatch should fail");
+
+        assert_eq!(
+            error,
+            EngineError::ResumeTickMismatch {
+                expected: 3,
+                got: 4
+            }
+        );
+    }
+
+    #[test]
+    fn artifact_summary_is_stable_for_golden_fixture_use() {
+        let recorded =
+            record_counter_replay(52, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let summary =
+            counter_replay_summary(&recorded.artifact).expect("summary generation should succeed");
+
+        assert_eq!(
+            summary.to_text(),
+            "engine_family=xenor-engine-rust/counter\nbase_seed=52\nfinal_tick=4\nfinal_checksum=9273508064903698236\nreplay_artifact_schema_version=1\nsnapshot_artifact_schema_version=1\ncommand_payload_schema_version=1\nsnapshot_payload_schema_version=1\nreplay_digest=4362292177231439159\nsnapshot_digest=15161838349500027775\n"
+        );
+    }
+
+    #[test]
+    fn imported_replay_remains_identical_to_original_trace() {
+        let recorded =
+            record_counter_replay(53, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let bytes = export_counter_replay_artifact(&recorded.artifact)
+            .expect("replay artifact should serialize");
+        let imported =
+            import_counter_replay_artifact(&bytes).expect("replay artifact should deserialize");
+
+        compare_replay_traces(
+            recorded.artifact.records.as_slice(),
+            imported.records.as_slice(),
+        )
+        .expect("imported replay should match original trace");
     }
 
     #[test]
@@ -372,5 +741,234 @@ mod tests {
             .expect("snapshot decoding should succeed");
 
         assert_eq!(decoded, engine.state().snapshot());
+    }
+
+    #[test]
+    fn generated_golden_fixture_verifies_against_rerun() {
+        let fixture = generate_counter_golden_fixture(
+            54,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        let result =
+            verify_counter_golden_fixture(&fixture).expect("fixture verification should run");
+
+        assert!(result.passed());
+        assert!(result.replay_mismatch.is_none());
+        assert!(result.snapshot_mismatch.is_none());
+    }
+
+    #[test]
+    fn golden_fixture_with_tampered_replay_artifact_fails() {
+        let mut fixture = generate_counter_golden_fixture(
+            55,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        fixture.replay_artifact.records[2].input.command.delta += 1;
+
+        let result =
+            verify_counter_golden_fixture(&fixture).expect("fixture verification should run");
+
+        assert!(!result.passed());
+        assert!(
+            result
+                .replay_mismatch
+                .as_deref()
+                .expect("replay mismatch should be present")
+                .contains("checksum mismatch")
+        );
+    }
+
+    #[test]
+    fn golden_fixture_with_tampered_summary_fails() {
+        let mut fixture = generate_counter_golden_fixture(
+            56,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        fixture.summary.final_checksum ^= 1;
+
+        let result =
+            verify_counter_golden_fixture(&fixture).expect("fixture verification should run");
+
+        assert!(!result.passed());
+        assert!(matches!(
+            result.comparison.first_mismatch(),
+            Some(ParityMismatch::FinalChecksum { .. })
+        ));
+    }
+
+    #[test]
+    fn golden_fixture_with_seed_mismatch_fails() {
+        let mut fixture = generate_counter_golden_fixture(
+            57,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        fixture.summary.base_seed += 1;
+
+        let result =
+            verify_counter_golden_fixture(&fixture).expect("fixture verification should run");
+
+        assert!(!result.passed());
+        assert!(matches!(
+            result.comparison.first_mismatch(),
+            Some(ParityMismatch::BaseSeed { .. })
+        ));
+    }
+
+    #[test]
+    fn golden_fixture_with_snapshot_mismatch_fails() {
+        let mut fixture = generate_counter_golden_fixture(
+            58,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        fixture
+            .snapshot_artifact
+            .as_mut()
+            .expect("fixture should carry a snapshot artifact")
+            .payload
+            .value += 1;
+
+        let result =
+            verify_counter_golden_fixture(&fixture).expect("fixture verification should run");
+
+        assert!(!result.passed());
+        assert!(
+            result
+                .snapshot_mismatch
+                .as_deref()
+                .expect("snapshot mismatch should be present")
+                .contains("snapshot payload digest mismatch")
+        );
+    }
+
+    #[test]
+    fn golden_fixture_verification_report_shows_expected_mismatch() {
+        let mut fixture = generate_counter_golden_fixture(
+            59,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        fixture.summary.final_checksum ^= 1;
+
+        let result =
+            verify_counter_golden_fixture(&fixture).expect("fixture verification should run");
+
+        assert!(
+            result
+                .comparison
+                .to_string()
+                .contains("final checksum mismatch")
+        );
+    }
+
+    #[test]
+    fn parity_summary_for_identical_runs_matches() {
+        let first =
+            record_counter_replay(60, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("first replay should succeed");
+        let second =
+            record_counter_replay(60, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("second replay should succeed");
+
+        let comparison = compare_parity_summaries(
+            &counter_parity_summary(&first.artifact).expect("summary should succeed"),
+            &counter_parity_summary(&second.artifact).expect("summary should succeed"),
+        );
+
+        assert!(comparison.is_match());
+        assert!(comparison.first_mismatch().is_none());
+    }
+
+    #[test]
+    fn parity_comparison_catches_final_checksum_mismatch() {
+        let recorded =
+            record_counter_replay(61, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let expected = counter_parity_summary(&recorded.artifact).expect("summary should succeed");
+        let mut actual = expected.clone();
+        actual.final_checksum ^= 1;
+
+        let comparison = compare_parity_summaries(&expected, &actual);
+
+        assert!(matches!(
+            comparison.first_mismatch(),
+            Some(ParityMismatch::FinalChecksum { .. })
+        ));
+    }
+
+    #[test]
+    fn parity_comparison_catches_replay_digest_mismatch() {
+        let recorded =
+            record_counter_replay(62, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let expected = counter_parity_summary(&recorded.artifact).expect("summary should succeed");
+        let mut actual = expected.clone();
+        actual.replay_digest ^= 1;
+
+        let comparison = compare_parity_summaries(&expected, &actual);
+
+        assert!(matches!(
+            comparison.first_mismatch(),
+            Some(ParityMismatch::ReplayDigest { .. })
+        ));
+    }
+
+    #[test]
+    fn parity_comparison_catches_snapshot_digest_mismatch() {
+        let recorded =
+            record_counter_replay(63, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let expected = counter_parity_summary(&recorded.artifact).expect("summary should succeed");
+        let mut actual = expected.clone();
+        actual.snapshot_digest = Some(actual.snapshot_digest.expect("snapshot digest") ^ 1);
+
+        let comparison = compare_parity_summaries(&expected, &actual);
+
+        assert!(matches!(
+            comparison.first_mismatch(),
+            Some(ParityMismatch::SnapshotDigest { .. })
+        ));
+    }
+
+    #[test]
+    fn parity_comparison_output_is_clear() {
+        let recorded =
+            record_counter_replay(64, SnapshotPolicy::Every { interval: 2 }, &sample_frames())
+                .expect("record mode should succeed");
+        let expected: ParityArtifactSummary =
+            counter_parity_summary(&recorded.artifact).expect("summary should succeed");
+        let mut actual = expected.clone();
+        actual.replay_digest ^= 1;
+
+        let comparison = compare_parity_summaries(&expected, &actual);
+
+        assert!(comparison.to_string().contains("replay digest mismatch"));
+    }
+
+    #[test]
+    fn golden_fixture_codec_roundtrip_matches_wrapper_surface() {
+        let fixture = generate_counter_golden_fixture(
+            65,
+            SnapshotPolicy::Every { interval: 2 },
+            &sample_frames(),
+        )
+        .expect("fixture generation should succeed");
+        let codec = counter_golden_fixture_codec();
+        let bytes = codec
+            .encode(&fixture)
+            .expect("fixture export should succeed");
+        let imported = codec.decode(&bytes).expect("fixture import should succeed");
+
+        assert_eq!(fixture, imported);
     }
 }

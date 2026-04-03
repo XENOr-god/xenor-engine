@@ -32,6 +32,17 @@ impl PhaseGroup {
             Self::Finalize => "Finalize",
         }
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "PreInput" => Some(Self::PreInput),
+            "Input" => Some(Self::Input),
+            "Simulation" => Some(Self::Simulation),
+            "PostSimulation" => Some(Self::PostSimulation),
+            "Finalize" => Some(Self::Finalize),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

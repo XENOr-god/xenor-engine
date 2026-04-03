@@ -1,11 +1,23 @@
-use crate::core::{EngineError, Seed, mix64};
+use crate::core::{EngineError, Seed, Tick, mix64};
 use crate::engine::{DeterministicEngine, Engine, SnapshotPolicy};
+use crate::fixture::{GoldenFixture, GoldenFixtureResult, GoldenFixtureSerializer};
 use crate::input::{Command, InputFrame};
+use crate::parity::ParityArtifactSummary;
+use crate::persistence::{
+    ArtifactSummary, RecordedReplay, ReplayArtifact, ReplayArtifactSerializer,
+    ReplayExecutionResult, SnapshotArtifact, SnapshotArtifactSerializer,
+    execute_replay_from_snapshot, execute_replay_verify, record_replay,
+};
 use crate::phases::{Phase, TickContext};
-use crate::replay::InMemoryReplayLog;
+use crate::replay::{InMemoryReplayLog, ReplayInspectionView, inspect_replay_trace};
 use crate::rng::{Rng, SplitMix64};
 use crate::scheduler::{FixedScheduler, PhaseGroup};
+use crate::serialization::{
+    CounterCommandTextSerializer, CounterSnapshotTextSerializer, Serializer,
+};
 use crate::state::{CounterSnapshot, CounterState, SimulationState};
+
+pub const COUNTER_ENGINE_FAMILY: &str = "xenor-engine-rust/counter";
 
 pub trait EngineApi<C: Command>: Engine<C> {
     fn snapshot(&self) -> <Self::State as SimulationState>::Snapshot {
@@ -36,6 +48,27 @@ pub type CounterEngine = DeterministicEngine<
     CounterReplayLog,
     CounterScheduler,
 >;
+pub type CounterReplayArtifact = ReplayArtifact<CounterCommand, CounterSnapshot>;
+pub type CounterSnapshotArtifact = SnapshotArtifact<CounterSnapshot>;
+pub type CounterRecordedReplay = RecordedReplay<CounterCommand, CounterSnapshot>;
+pub type CounterReplayResult = ReplayExecutionResult<CounterSnapshot>;
+pub type CounterReplayArtifactCodec = ReplayArtifactSerializer<
+    CounterCommand,
+    CounterSnapshot,
+    CounterCommandTextSerializer,
+    CounterSnapshotTextSerializer,
+>;
+pub type CounterSnapshotArtifactCodec =
+    SnapshotArtifactSerializer<CounterSnapshot, CounterSnapshotTextSerializer>;
+pub type CounterGoldenFixture = GoldenFixture<CounterCommand, CounterSnapshot>;
+pub type CounterGoldenFixtureResult = GoldenFixtureResult;
+pub type CounterGoldenFixtureCodec = GoldenFixtureSerializer<
+    CounterCommand,
+    CounterSnapshot,
+    CounterCommandTextSerializer,
+    CounterSnapshotTextSerializer,
+>;
+pub type CounterParitySummary = ParityArtifactSummary;
 
 #[derive(Default)]
 pub struct ResetFinalizeMarkerPhase;
@@ -173,6 +206,152 @@ pub fn counter_engine_with_policy(seed: Seed, snapshot_policy: SnapshotPolicy) -
 
 pub fn minimal_counter_engine(seed: Seed) -> CounterEngine {
     counter_engine_with_policy(seed, SnapshotPolicy::Every { interval: 1 })
+}
+
+pub fn counter_replay_artifact_codec() -> CounterReplayArtifactCodec {
+    ReplayArtifactSerializer::new(
+        COUNTER_ENGINE_FAMILY,
+        CounterCommandTextSerializer,
+        CounterSnapshotTextSerializer,
+    )
+}
+
+pub fn counter_snapshot_artifact_codec() -> CounterSnapshotArtifactCodec {
+    SnapshotArtifactSerializer::new(COUNTER_ENGINE_FAMILY, CounterSnapshotTextSerializer)
+}
+
+pub fn counter_golden_fixture_codec() -> CounterGoldenFixtureCodec {
+    GoldenFixtureSerializer::new(
+        counter_replay_artifact_codec(),
+        counter_snapshot_artifact_codec(),
+    )
+}
+
+pub fn record_counter_replay(
+    seed: Seed,
+    snapshot_policy: SnapshotPolicy,
+    frames: &[InputFrame<CounterCommand>],
+) -> Result<CounterRecordedReplay, EngineError> {
+    let codec = counter_replay_artifact_codec();
+    record_replay::<CounterCommand, CounterState, CounterEngine, _, _, _>(
+        seed,
+        snapshot_policy,
+        frames,
+        counter_engine_with_policy,
+        &codec,
+    )
+}
+
+pub fn export_counter_replay_artifact(
+    artifact: &CounterReplayArtifact,
+) -> Result<Vec<u8>, EngineError> {
+    counter_replay_artifact_codec().encode(artifact)
+}
+
+pub fn import_counter_replay_artifact(bytes: &[u8]) -> Result<CounterReplayArtifact, EngineError> {
+    counter_replay_artifact_codec().decode(bytes)
+}
+
+pub fn counter_replay_summary(
+    artifact: &CounterReplayArtifact,
+) -> Result<ArtifactSummary, EngineError> {
+    counter_replay_artifact_codec().summary(artifact)
+}
+
+pub fn counter_parity_summary(
+    artifact: &CounterReplayArtifact,
+) -> Result<CounterParitySummary, EngineError> {
+    counter_replay_summary(artifact).map(|summary| CounterParitySummary::from(&summary))
+}
+
+pub fn inspect_counter_replay(artifact: &CounterReplayArtifact) -> ReplayInspectionView {
+    inspect_replay_trace(artifact.records.as_slice())
+}
+
+pub fn verify_counter_replay(
+    artifact: &CounterReplayArtifact,
+) -> Result<CounterReplayResult, EngineError> {
+    let codec = counter_replay_artifact_codec();
+    execute_replay_verify::<CounterCommand, CounterState, CounterEngine, _, _, _>(
+        artifact,
+        counter_engine_with_policy,
+        &codec,
+    )
+}
+
+pub fn counter_snapshot_artifact_from_engine(engine: &CounterEngine) -> CounterSnapshotArtifact {
+    counter_snapshot_artifact_codec().build_artifact(engine.seed(), &engine.manual_snapshot())
+}
+
+pub fn counter_snapshot_artifact_at_tick(
+    artifact: &CounterReplayArtifact,
+    tick: Tick,
+) -> Result<CounterSnapshotArtifact, EngineError> {
+    let snapshot = artifact
+        .records
+        .iter()
+        .find(|record| record.tick == tick)
+        .and_then(|record| record.snapshot.as_ref())
+        .ok_or_else(|| EngineError::ReplayContinuationMismatch {
+            detail: format!("no snapshot recorded at tick {tick}"),
+        })?;
+
+    Ok(counter_snapshot_artifact_codec().build_artifact(artifact.metadata.base_seed, snapshot))
+}
+
+pub fn export_counter_snapshot_artifact(
+    artifact: &CounterSnapshotArtifact,
+) -> Result<Vec<u8>, EngineError> {
+    counter_snapshot_artifact_codec().encode(artifact)
+}
+
+pub fn import_counter_snapshot_artifact(
+    bytes: &[u8],
+) -> Result<CounterSnapshotArtifact, EngineError> {
+    counter_snapshot_artifact_codec().decode(bytes)
+}
+
+pub fn generate_counter_golden_fixture(
+    seed: Seed,
+    snapshot_policy: SnapshotPolicy,
+    frames: &[InputFrame<CounterCommand>],
+) -> Result<CounterGoldenFixture, EngineError> {
+    counter_golden_fixture_codec().generate_fixture::<CounterState, CounterEngine, _>(
+        seed,
+        snapshot_policy,
+        frames,
+        counter_engine_with_policy,
+    )
+}
+
+pub fn export_counter_golden_fixture(
+    fixture: &CounterGoldenFixture,
+) -> Result<Vec<u8>, EngineError> {
+    counter_golden_fixture_codec().encode(fixture)
+}
+
+pub fn import_counter_golden_fixture(bytes: &[u8]) -> Result<CounterGoldenFixture, EngineError> {
+    counter_golden_fixture_codec().decode(bytes)
+}
+
+pub fn verify_counter_golden_fixture(
+    fixture: &CounterGoldenFixture,
+) -> Result<CounterGoldenFixtureResult, EngineError> {
+    counter_golden_fixture_codec()
+        .verify_fixture::<CounterState, CounterEngine, _>(fixture, counter_engine_with_policy)
+}
+
+pub fn resume_counter_replay_from_snapshot(
+    snapshot: &CounterSnapshotArtifact,
+    artifact: &CounterReplayArtifact,
+) -> Result<CounterReplayResult, EngineError> {
+    let codec = counter_replay_artifact_codec();
+    execute_replay_from_snapshot::<CounterCommand, CounterState, CounterEngine, _, _, _>(
+        snapshot,
+        artifact,
+        counter_engine_with_policy,
+        &codec,
+    )
 }
 
 pub fn one_tick_counter_snapshot(seed: Seed, delta: i64) -> CounterSnapshot {

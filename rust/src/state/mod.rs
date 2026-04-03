@@ -8,6 +8,15 @@ pub trait SimulationState: Clone {
     fn checksum(&self) -> u64;
     fn snapshot(&self) -> Self::Snapshot;
     fn restore_snapshot(&mut self, snapshot: Self::Snapshot);
+    fn snapshot_schema_version() -> u32
+    where
+        Self: Sized;
+    fn snapshot_checksum(snapshot: &Self::Snapshot) -> u64
+    where
+        Self: Sized;
+    fn snapshot_tick(snapshot: &Self::Snapshot) -> Tick
+    where
+        Self: Sized;
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -86,6 +95,18 @@ impl CounterState {
     pub fn finalize(&mut self, marker: u64) {
         self.finalize_marker = marker;
     }
+
+    fn snapshot_checksum_words(snapshot: &CounterSnapshot) -> [u64; 7] {
+        [
+            snapshot.tick,
+            snapshot.value as u64,
+            snapshot.velocity as u64,
+            snapshot.pending_delta as u64,
+            snapshot.pending_entropy,
+            snapshot.entropy_budget,
+            snapshot.finalize_marker,
+        ]
+    }
 }
 
 impl SimulationState for CounterState {
@@ -100,15 +121,7 @@ impl SimulationState for CounterState {
     }
 
     fn checksum(&self) -> u64 {
-        checksum_words(&[
-            self.tick,
-            self.value as u64,
-            self.velocity as u64,
-            self.pending_delta as u64,
-            self.pending_entropy,
-            self.entropy_budget,
-            self.finalize_marker,
-        ])
+        checksum_words(&Self::snapshot_checksum_words(&self.snapshot()))
     }
 
     fn snapshot(&self) -> Self::Snapshot {
@@ -131,5 +144,26 @@ impl SimulationState for CounterState {
         self.pending_entropy = snapshot.pending_entropy;
         self.entropy_budget = snapshot.entropy_budget;
         self.finalize_marker = snapshot.finalize_marker;
+    }
+
+    fn snapshot_schema_version() -> u32
+    where
+        Self: Sized,
+    {
+        1
+    }
+
+    fn snapshot_checksum(snapshot: &Self::Snapshot) -> u64
+    where
+        Self: Sized,
+    {
+        checksum_words(&Self::snapshot_checksum_words(snapshot))
+    }
+
+    fn snapshot_tick(snapshot: &Self::Snapshot) -> Tick
+    where
+        Self: Sized,
+    {
+        snapshot.tick
     }
 }

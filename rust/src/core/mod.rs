@@ -22,9 +22,38 @@ pub enum EngineError {
         phase: &'static str,
         reason: String,
     },
+    UnsupportedSchemaVersion {
+        artifact: &'static str,
+        expected: u32,
+        got: u32,
+    },
+    ReplayDecode {
+        detail: String,
+    },
+    SnapshotDecode {
+        detail: String,
+    },
     SnapshotSerialization {
         tick: Tick,
         reason: String,
+    },
+    SnapshotMetadataMismatch {
+        detail: String,
+    },
+    SeedMismatch {
+        expected: Seed,
+        got: Seed,
+    },
+    ReplayContinuationMismatch {
+        detail: String,
+    },
+    ResumeTickMismatch {
+        expected: Tick,
+        got: Tick,
+    },
+    CorruptedArtifact {
+        artifact: &'static str,
+        detail: String,
     },
     ReplayMismatch {
         tick: Option<Tick>,
@@ -53,8 +82,33 @@ impl fmt::Display for EngineError {
                 f,
                 "phase `{phase}` in group `{group}` failed at tick {tick}: {reason}"
             ),
+            Self::UnsupportedSchemaVersion {
+                artifact,
+                expected,
+                got,
+            } => write!(
+                f,
+                "unsupported {artifact} schema version: expected {expected}, got {got}"
+            ),
+            Self::ReplayDecode { detail } => write!(f, "replay decode failed: {detail}"),
+            Self::SnapshotDecode { detail } => write!(f, "snapshot decode failed: {detail}"),
             Self::SnapshotSerialization { tick, reason } => {
                 write!(f, "snapshot serialization failed at tick {tick}: {reason}")
+            }
+            Self::SnapshotMetadataMismatch { detail } => {
+                write!(f, "snapshot metadata mismatch: {detail}")
+            }
+            Self::SeedMismatch { expected, got } => {
+                write!(f, "seed mismatch: expected {expected}, got {got}")
+            }
+            Self::ReplayContinuationMismatch { detail } => {
+                write!(f, "replay continuation mismatch: {detail}")
+            }
+            Self::ResumeTickMismatch { expected, got } => {
+                write!(f, "resume tick mismatch: expected {expected}, got {got}")
+            }
+            Self::CorruptedArtifact { artifact, detail } => {
+                write!(f, "corrupted {artifact} artifact: {detail}")
             }
             Self::ReplayMismatch { tick, detail } => match tick {
                 Some(tick) => write!(f, "replay mismatch at tick {tick}: {detail}"),
@@ -78,6 +132,19 @@ pub fn checksum_words(words: &[u64]) -> u64 {
     for &word in words {
         checksum = mix64(checksum ^ word);
     }
+    checksum
+}
+
+pub fn checksum_bytes(bytes: &[u8]) -> u64 {
+    let mut checksum = 0x6eed_0e9d_a4d9_4a4f;
+    let mut chunk = [0u8; 8];
+
+    for part in bytes.chunks(8) {
+        chunk.fill(0);
+        chunk[..part.len()].copy_from_slice(part);
+        checksum = mix64(checksum ^ u64::from_le_bytes(chunk));
+    }
+
     checksum
 }
 
