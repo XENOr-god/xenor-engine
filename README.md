@@ -12,9 +12,9 @@ the main XENOr protocol logic itself.
 ## Status
 
 Active systems repository. The C++ engine has public release tags, and the Rust
-workspace is an active determinism and artifact-validation surface. Both remain
-deliberately narrow and should be treated as systems infrastructure rather than
-the main protocol entry point.
+workspace is an active determinism and artifact-validation surface that is not
+published separately. Both remain deliberately narrow and should be treated as
+systems infrastructure rather than the main protocol entry point.
 
 ## Why This Repo Exists
 
@@ -126,7 +126,11 @@ artifact-validation surface:
 - [`xenor-sale`](https://github.com/XENOr-god/xenor-sale) — archived
   historical sale prototype
 
+## Contributing
+
+Contribution guidance lives in [CONTRIBUTING.md](CONTRIBUTING.md). Use issues
+or pull requests directly for scoped engine changes.
+
 ## License
 
-Released under the [MIT License](LICENSE). Contribution guidelines live in
-[CONTRIBUTING.md](CONTRIBUTING.md).
+Released under the [MIT License](LICENSE).
